@@ -1,552 +1,552 @@
 import asyncio
 import aiohttp
-from collections import Counter
+import random
+from collections import deque
 from datetime import datetime
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = "8778249747:AAFnLZeDZYuRXVyjJrdQqIndezMe7-kHGs0"
 
-APIS = {
+API_URLS = {
     "md5": "https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412",
     "hu":  "https://wtx.tele68.com/v1/tx/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412",
 }
 
-HEADERS = {
+REQ_HEADERS = {
     "accept": "*/*",
-    "accept-language": "vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5",
+    "accept-language": "vi-VN,vi;q=0.9",
     "Referer": "https://lc79b.bet/",
 }
 
-DICE_EMOJI = ["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"]
+GAME_LABEL = {"md5": "🎮 *LC MD5*", "hu": "🏆 *LC Hũ*"}
+DICE_EMO = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣"}
 
-active_chats = {}
-history_data = {"md5": [], "hu": []}
-pred_history = {"md5": [], "hu": []}
-last_session_id = {"md5": None, "hu": None}
-pending_prediction = {"md5": None, "hu": None}
-correct_count = {"md5": 0, "hu": 0}
-wrong_count = {"md5": 0, "hu": 0}
-algo_version = {"md5": 0, "hu": 0}
-weights = {
-    "md5": {"bridge": 0.40, "trend": 0.20, "pattern": 0.20, "freq": 0.20},
-    "hu":  {"bridge": 0.40, "trend": 0.20, "pattern": 0.20, "freq": 0.20},
+ALGO_NAME_VN = {
+    "streak":       "Cầu bệt",
+    "break_detect": "Phát hiện gãy cầu",
+    "pingpong":     "Cầu 1-1 ping pong",
+    "pairs":        "Cầu 2-2 / 3-3",
+    "zigzag":       "Cầu zigzag",
+    "freq20":       "Tần suất 20 phiên",
+    "freq50":       "Tần suất 50 phiên",
+    "point_trend":  "Xu hướng điểm số",
+    "pattern6":     "Pattern 6 phiên lịch sử",
+    "trend":        "Xu hướng tổng thể",
+    "dice_avg":     "Trung bình xúc xắc",
+    "momentum":     "Đà tăng / giảm điểm",
 }
 
 
-def _opposite(r):
-    return "XIU" if r == "TAI" else "TAI"
+def default_weights():
+    return {
+        "streak":       1.5,
+        "break_detect": 1.8,
+        "pingpong":     1.2,
+        "pairs":        1.1,
+        "zigzag":       0.8,
+        "freq20":       1.0,
+        "freq50":       0.9,
+        "point_trend":  0.7,
+        "pattern6":     1.3,
+        "trend":        0.9,
+        "dice_avg":     0.6,
+        "momentum":     1.0,
+    }
 
 
-def analyze_bridge(results):
-    if len(results) < 2:
-        return "unknown", 0
+def make_game():
+    return {
+        "running":  False,
+        "task":     None,
+        "history":  deque(maxlen=100),
+        "preds":    deque(maxlen=500),
+        "last_id":  None,
+        "chat_id":  None,
+        "weights":  default_weights(),
+        "correct":  0,
+        "wrong":    0,
+        "pending":  None,
+    }
 
+
+STATE = {"md5": make_game(), "hu": make_game()}
+
+
+def _streak_info(h):
+    if not h:
+        return None, 0
+    last = h[0]["result"]
     streak = 1
-    for i in range(1, len(results)):
-        if results[i] == results[0]:
+    for i in range(1, len(h)):
+        if h[i]["result"] == last:
             streak += 1
         else:
             break
-
-    if streak >= 2:
-        return "bet_long" if streak >= 4 else "bet", streak
-
-    alt_len = 1
-    for i in range(1, min(10, len(results))):
-        expected = results[0] if i % 2 == 0 else _opposite(results[0])
-        if results[i] == expected:
-            alt_len += 1
-        else:
-            break
-
-    if alt_len >= 4:
-        return "one_one", alt_len
-
-    if len(results) >= 4:
-        pair_ok = all(results[i] == results[i ^ 1] for i in range(min(8, len(results) - 1)))
-        if pair_ok:
-            return "two_two", len(results)
-
-    zigzag = True
-    for i in range(min(8, len(results) - 1)):
-        if results[i] == results[i + 1]:
-            zigzag = False
-            break
-    if zigzag and alt_len < 4:
-        return "zigzag", 0
-
-    return "mixed", 0
+    return last, streak
 
 
-def break_probability(bridge_type, streak):
-    if bridge_type == "bet_long":
-        return min(0.80, 0.50 + (streak - 4) * 0.08)
-    if bridge_type == "bet" and streak == 3:
-        return 0.45
-    if bridge_type == "one_one" and streak >= 6:
-        return 0.50 + (streak - 6) * 0.06
-    return 0.0
+def algo_streak(h):
+    last, s = _streak_info(h)
+    if s < 2:
+        return None, 0
+    if s <= 3:
+        return last, 52
+    return last, 56
 
 
-def bridge_vote(results):
-    bridge_type, streak = analyze_bridge(results)
-    bp = break_probability(bridge_type, streak)
-
-    if bridge_type in ("bet", "bet_long"):
-        if bp >= 0.55:
-            return _opposite(results[0]), bp, f"🔴 Cầu bệt {streak} — khả năng gãy {bp:.0%}"
-        return results[0], 0.55 + streak * 0.03, f"🟢 Cầu bệt {streak} — theo cầu"
-
-    if bridge_type == "one_one":
-        nxt = _opposite(results[0])
-        if bp >= 0.50:
-            return results[0], bp, f"🔴 Cầu 1‑1 dài {streak} — lệch nhịp"
-        return nxt, 0.60, f"🟢 Cầu 1‑1 — đảo chiều"
-
-    if bridge_type == "two_two":
-        if len(results) >= 2 and results[0] == results[1]:
-            return _opposite(results[0]), 0.58, "🟡 Cầu 2‑2 — chuyển cặp"
-        return results[0], 0.55, "🟡 Cầu 2‑2 — theo hiện tại"
-
-    if bridge_type == "zigzag":
-        return _opposite(results[0]), 0.52, "🔵 Cầu zigzag — đảo chiều"
-
-    return None, 0.0, "⚪ Cầu hỗn hợp"
+def algo_break_detect(h):
+    last, s = _streak_info(h)
+    if s >= 5:
+        opp = "TAI" if last == "XIU" else "XIU"
+        return opp, min(82, 60 + (s - 5) * 5)
+    return None, 0
 
 
-def freq_vote(results, window=20):
-    sample = results[:window]
-    if not sample:
-        return None, 0.0, ""
-    tai = sample.count("TAI")
-    total = len(sample)
-    tai_r = tai / total
-    xiu_r = 1 - tai_r
-
-    if tai_r > 0.62:
-        return "XIU", min(0.65, 0.50 + (tai_r - 0.50)), f"📊 Tần số {window}p — TAI {tai_r:.0%} → bù XIU"
-    if xiu_r > 0.62:
-        return "TAI", min(0.65, 0.50 + (xiu_r - 0.50)), f"📊 Tần số {window}p — XIU {xiu_r:.0%} → bù TAI"
-    if tai_r > xiu_r:
-        return "TAI", tai_r, f"📊 Tần số {window}p — TAI dẫn {tai_r:.0%}"
-    return "XIU", xiu_r, f"📊 Tần số {window}p — XIU dẫn {xiu_r:.0%}"
+def algo_pingpong(h):
+    if len(h) < 4:
+        return None, 0
+    r = [h[i]["result"] for i in range(min(6, len(h)))]
+    if all(r[i] != r[i + 1] for i in range(min(5, len(r) - 1))):
+        return ("TAI" if r[0] == "XIU" else "XIU"), 68
+    if len(r) >= 4 and all(r[i] != r[i + 1] for i in range(3)):
+        return ("TAI" if r[0] == "XIU" else "XIU"), 60
+    return None, 0
 
 
-def pattern_vote(results, pattern_len=6):
-    if len(results) < pattern_len * 2 + 1:
-        return None, 0.0, ""
-
-    target = tuple(results[:pattern_len])
-    matches = []
-
-    for i in range(pattern_len, len(results) - 1):
-        window = tuple(results[i: i + pattern_len])
-        if window == target:
-            matches.append(results[i - 1])
-
-    if not matches:
-        return None, 0.0, ""
-
-    c = Counter(matches)
-    best, cnt = c.most_common(1)[0]
-    conf = cnt / len(matches)
-    if conf < 0.55:
-        return None, 0.0, ""
-    return best, conf, f"🔁 Pattern {pattern_len}p — {len(matches)} mẫu khớp ({conf:.0%})"
+def algo_pairs(h):
+    if len(h) < 6:
+        return None, 0
+    r = [h[i]["result"] for i in range(min(8, len(h)))]
+    if len(r) >= 4 and r[0] == r[1] and r[2] == r[3] and r[0] != r[2]:
+        return r[0], 62
+    if len(r) >= 6 and r[0] == r[1] == r[2] and r[3] == r[4] == r[5] and r[0] != r[3]:
+        return r[0], 66
+    return None, 0
 
 
-def trend_vote(results, window=10):
-    sample = results[:window]
-    if len(sample) < window:
-        return None, 0.0, ""
-    tai = sample.count("TAI")
-    if tai >= 7:
-        score = 0.55 + (tai - 7) * 0.05
-        return "TAI", min(score, 0.70), f"📈 Xu hướng {window}p — TAI mạnh ({tai}/{window})"
-    if tai <= 3:
-        score = 0.55 + (3 - tai) * 0.05
-        return "XIU", min(score, 0.70), f"📉 Xu hướng {window}p — XIU mạnh ({window-tai}/{window})"
-    return None, 0.0, ""
+def algo_zigzag(h):
+    if len(h) < 6:
+        return None, 0
+    r = [h[i]["result"] for i in range(6)]
+    changes = [r[i] != r[i + 1] for i in range(5)]
+    score = sum(1 for i in range(4) if changes[i] != changes[i + 1])
+    if score >= 3:
+        pred = r[0] if not changes[0] else ("TAI" if r[0] == "XIU" else "XIU")
+        return pred, 57
+    return None, 0
 
 
-def point_hint(sessions):
-    if len(sessions) < 5:
-        return None, 0.0
-    points = [s["point"] for s in sessions[:15]]
-    tai_p = sum(1 for p in points if p >= 11)
-    xiu_p = sum(1 for p in points if p <= 10)
-    total = len(points)
-    if tai_p / total > 0.65:
-        return "TAI", 0.55
-    if xiu_p / total > 0.65:
-        return "XIU", 0.55
-    return None, 0.0
+def algo_freq20(h):
+    n = min(20, len(h))
+    if n < 5:
+        return None, 0
+    tai = sum(1 for i in range(n) if h[i]["result"] == "TAI")
+    r = tai / n
+    if r > 0.68:
+        return "XIU", int(r * 65)
+    if r < 0.32:
+        return "TAI", int((1 - r) * 65)
+    return None, 0
 
 
-def predict(game_type):
-    sessions = history_data[game_type]
-    if len(sessions) < 4:
-        return "TAI", 0.50, "⚪ Chưa đủ dữ liệu"
+def algo_freq50(h):
+    n = min(50, len(h))
+    if n < 15:
+        return None, 0
+    tai = sum(1 for i in range(n) if h[i]["result"] == "TAI")
+    r = tai / n
+    if r > 0.65:
+        return "XIU", int(r * 60)
+    if r < 0.35:
+        return "TAI", int((1 - r) * 60)
+    return None, 0
 
-    results = [s["resultTruyenThong"] for s in sessions]
-    w = weights[game_type]
+
+def algo_point_trend(h):
+    if len(h) < 5:
+        return None, 0
+    avg = sum(h[i]["point"] for i in range(5)) / 5
+    if avg > 12.5:
+        return "TAI", 56
+    if avg < 8.5:
+        return "XIU", 56
+    return None, 0
+
+
+def algo_pattern6(h):
+    n = len(h)
+    if n < 14:
+        return None, 0
+    pattern = tuple(h[i]["result"] for i in range(6))
+    tai_c = xiu_c = 0
+    for i in range(6, n - 6):
+        win = tuple(h[j]["result"] for j in range(i, i + 6))
+        if win == pattern:
+            after = h[i - 1]["result"]
+            if after == "TAI":
+                tai_c += 1
+            else:
+                xiu_c += 1
+    total = tai_c + xiu_c
+    if total < 2:
+        return None, 0
+    if tai_c >= xiu_c:
+        return "TAI", min(73, int((tai_c / total) * 75))
+    return "XIU", min(73, int((xiu_c / total) * 75))
+
+
+def algo_trend(h):
+    if len(h) < 10:
+        return None, 0
+    r_tai = sum(1 for i in range(5) if h[i]["result"] == "TAI")
+    o_tai = sum(1 for i in range(5, 10) if h[i]["result"] == "TAI")
+    diff = r_tai - o_tai
+    if diff >= 3:
+        return "TAI", 60
+    if diff <= -3:
+        return "XIU", 60
+    return None, 0
+
+
+def algo_dice_avg(h):
+    if len(h) < 8:
+        return None, 0
+    all_dice = []
+    for i in range(min(15, len(h))):
+        all_dice.extend(h[i].get("dices", []))
+    if not all_dice:
+        return None, 0
+    avg = sum(all_dice) / len(all_dice)
+    if avg > 3.8:
+        return "TAI", 54
+    if avg < 3.2:
+        return "XIU", 54
+    return None, 0
+
+
+def algo_momentum(h):
+    if len(h) < 3:
+        return None, 0
+    p0, p1, p2 = h[0]["point"], h[1]["point"], h[2]["point"]
+    if p0 > p1 > p2:
+        return "TAI", 55
+    if p0 < p1 < p2:
+        return "XIU", 55
+    return None, 0
+
+
+ALGOS = {
+    "streak":       algo_streak,
+    "break_detect": algo_break_detect,
+    "pingpong":     algo_pingpong,
+    "pairs":        algo_pairs,
+    "zigzag":       algo_zigzag,
+    "freq20":       algo_freq20,
+    "freq50":       algo_freq50,
+    "point_trend":  algo_point_trend,
+    "pattern6":     algo_pattern6,
+    "trend":        algo_trend,
+    "dice_avg":     algo_dice_avg,
+    "momentum":     algo_momentum,
+}
+
+
+def predict(history, weights):
+    if len(history) < 2:
+        tai = sum(1 for i in range(len(history)) if history[i]["result"] == "TAI")
+        return ("TAI" if tai * 2 >= len(history) else "XIU"), 50
+
     votes = {"TAI": 0.0, "XIU": 0.0}
-    signals = []
-
-    r_bridge, c_bridge, s_bridge = bridge_vote(results)
-    if r_bridge:
-        votes[r_bridge] += w["bridge"] * c_bridge * 10
-        signals.append(s_bridge)
-
-    r_freq, c_freq, s_freq = freq_vote(results, 20)
-    if r_freq:
-        votes[r_freq] += w["freq"] * c_freq * 10
-        signals.append(s_freq)
-
-    r_freq50, c_freq50, _ = freq_vote(results, 50)
-    if r_freq50:
-        votes[r_freq50] += w["freq"] * c_freq50 * 4
-
-    r_pat, c_pat, s_pat = pattern_vote(results, 6)
-    if r_pat:
-        votes[r_pat] += w["pattern"] * c_pat * 10
-        signals.append(s_pat)
-
-    r_trend, c_trend, s_trend = trend_vote(results, 10)
-    if r_trend:
-        votes[r_trend] += w["trend"] * c_trend * 10
-        signals.append(s_trend)
-
-    r_pt, c_pt = point_hint(sessions)
-    if r_pt:
-        votes[r_pt] += 0.5 * c_pt * 10
+    for name, fn in ALGOS.items():
+        w = weights.get(name, 1.0)
+        pred, conf = fn(history)
+        if pred and conf > 0:
+            votes[pred] += w * conf
 
     total = votes["TAI"] + votes["XIU"]
     if total == 0:
-        pred = "TAI"
-        conf = 0.50
-    elif votes["TAI"] >= votes["XIU"]:
-        pred = "TAI"
-        conf = votes["TAI"] / total
-    else:
-        pred = "XIU"
-        conf = votes["XIU"] / total
+        tai = sum(1 for i in range(min(10, len(history))) if history[i]["result"] == "TAI")
+        return ("TAI" if tai >= 5 else "XIU"), 50
 
-    conf = min(0.95, max(0.50, conf))
-    detail = " · ".join(signals[:3]) if signals else "⚪ Phân tích tổng hợp"
-    return pred, conf, detail
+    tai_r = votes["TAI"] / total
+    if tai_r >= 0.5:
+        return "TAI", min(95, int(tai_r * 100))
+    return "XIU", min(95, int((1 - tai_r) * 100))
 
 
-def conf_label(conf):
-    if conf >= 0.80:
-        return f"🔥 *{conf:.0%}* — Rất cao"
-    if conf >= 0.68:
-        return f"⚡ *{conf:.0%}* — Cao"
-    if conf >= 0.58:
-        return f"🟡 *{conf:.0%}* — Trung bình"
-    return f"⚪ *{conf:.0%}* — Thấp"
-
-
-def game_label(game_type):
-    return "🎮 *LC MD5*" if game_type == "md5" else "🏆 *LC HŨ*"
-
-
-async def fetch_sessions(game_type):
+async def fetch_api(game_type):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                APIS[game_type],
-                headers=HEADERS,
-                timeout=aiohttp.ClientTimeout(total=10),
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(
+                API_URLS[game_type],
+                headers=REQ_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
+                    data = await resp.json(content_type=None)
                     return data.get("list", [])
     except Exception:
         pass
     return []
 
 
-def update_history(game_type, sessions):
-    existing_ids = {s["id"] for s in history_data[game_type]}
-    for s in reversed(sessions):
-        if s["id"] not in existing_ids:
-            history_data[game_type].insert(0, s)
-            existing_ids.add(s["id"])
-    history_data[game_type] = sorted(
-        history_data[game_type], key=lambda x: x["id"], reverse=True
-    )[:100]
+def build_msg(game_type, next_id, pred, conf, latest, match=None):
+    st = STATE[game_type]
+    now = datetime.now().strftime("%H:%M:%S")
+
+    p_emo = "🔴" if pred == "TAI" else "🔵"
+    p_txt = "TÀI" if pred == "TAI" else "XỈU"
+    r_emo = "🔴" if latest["result"] == "TAI" else "🔵"
+    r_txt = "TÀI" if latest["result"] == "TAI" else "XỈU"
+
+    dice_str = " ".join(DICE_EMO.get(d, str(d)) for d in latest.get("dices", []))
+    stars = "⭐" * max(1, conf // 20)
+
+    total = st["correct"] + st["wrong"]
+    acc_line = ""
+    if total > 0:
+        acc = int(st["correct"] / total * 100)
+        acc_line = f"📈 *Tỉ lệ:* `{st['correct']}/{total}` _({acc}%)_\n"
+
+    match_line = ""
+    if match == "correct":
+        match_line = "\n✅ *Khớp dự đoán!* 🎉"
+    elif match == "wrong":
+        match_line = "\n❌ *Lệch dự đoán!* 📉"
+
+    return (
+        f"{GAME_LABEL[game_type]}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 *Phiên dự đoán:* `{next_id}`\n"
+        f"💡 *Dự đoán:* {p_emo} *{p_txt}*\n"
+        f"📊 *Tin cậy:* `{conf}%` {stars}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"⏮ *Phiên trước:* `{latest['id']}`\n"
+        f"🎲 *Xúc xắc:* {dice_str} _( Σ {latest['point']} )_\n"
+        f"🏆 *Kết quả:* {r_emo} *{r_txt}*"
+        f"{match_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"{acc_line}"
+        f"⏰ *Time:* `{now}`"
+    )
 
 
-async def polling_loop(app, game_type):
-    while True:
-        try:
-            sessions = await fetch_sessions(game_type)
+def parse_entry(s):
+    return {
+        "id":     s["id"],
+        "result": s["resultTruyenThong"],
+        "dices":  s.get("dices", []),
+        "point":  s.get("point", 0),
+    }
+
+
+async def prediction_loop(bot, game_type):
+    st = STATE[game_type]
+    try:
+        sessions = await fetch_api(game_type)
+        if sessions:
+            for s in reversed(sessions):
+                st["history"].appendleft(parse_entry(s))
+
+            latest = sessions[0]
+            st["last_id"] = latest["id"]
+            pred, conf = predict(st["history"], st["weights"])
+            st["pending"] = {"id": latest["id"] + 1, "pred": pred}
+
+            msg = build_msg(game_type, latest["id"] + 1, pred, conf, st["history"][0])
+            await bot.send_message(chat_id=st["chat_id"], text=msg, parse_mode=ParseMode.MARKDOWN)
+
+        while st["running"]:
+            await asyncio.sleep(5)
+
+            sessions = await fetch_api(game_type)
             if not sessions:
-                await asyncio.sleep(5)
                 continue
 
-            update_history(game_type, sessions)
             latest_id = sessions[0]["id"]
-
-            if last_session_id[game_type] is None:
-                last_session_id[game_type] = latest_id
-                await asyncio.sleep(5)
+            if latest_id == st["last_id"]:
                 continue
 
-            if latest_id == last_session_id[game_type]:
-                await asyncio.sleep(5)
-                continue
+            entry = parse_entry(sessions[0])
+            st["history"].appendleft(entry)
 
-            last_session_id[game_type] = latest_id
-            new_session = sessions[0]
-
-            match_str = ""
-            if pending_prediction[game_type] is not None:
-                pred_res, pred_conf = pending_prediction[game_type]
-                actual = new_session["resultTruyenThong"]
-                correct = pred_res == actual
+            match = None
+            if st["pending"] and st["pending"]["id"] == latest_id:
+                correct = entry["result"] == st["pending"]["pred"]
                 if correct:
-                    correct_count[game_type] += 1
+                    st["correct"] += 1
+                    match = "correct"
                 else:
-                    wrong_count[game_type] += 1
-                pred_history[game_type].append(
-                    {
-                        "session_id": latest_id,
-                        "actual": actual,
-                        "predicted": pred_res,
-                        "correct": correct,
-                        "time": datetime.now().strftime("%H:%M:%S"),
-                    }
-                )
-                match_str = "✅ *Khớp*" if correct else "❌ *Lệch*"
+                    st["wrong"] += 1
+                    match = "wrong"
+                st["preds"].appendleft({
+                    "id":      latest_id,
+                    "pred":    st["pending"]["pred"],
+                    "actual":  entry["result"],
+                    "correct": correct,
+                })
 
-            pred, conf, detail = predict(game_type)
-            pending_prediction[game_type] = (pred, conf)
+            st["last_id"] = latest_id
+            pred, conf = predict(st["history"], st["weights"])
+            st["pending"] = {"id": latest_id + 1, "pred": pred}
 
-            pred_str = "🔴 *TÀI*" if pred == "TAI" else "🔵 *XỈU*"
-            time_str = datetime.now().strftime("%H:%M:%S %d/%m")
+            msg = build_msg(game_type, latest_id + 1, pred, conf, entry, match)
+            await bot.send_message(chat_id=st["chat_id"], text=msg, parse_mode=ParseMode.MARKDOWN)
 
-            msg = (
-                f"{game_label(game_type)}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 *Phiên:* `#{latest_id}`\n"
-                f"💡 *Dự đoán:* {pred_str}\n"
-                f"📊 *Tin cậy:* {conf_label(conf)}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-            )
-
-            dices = new_session["dices"]
-            dice_str = " ".join(DICE_EMOJI[d - 1] for d in dices)
-            res_icon = "🔴 *TÀI*" if new_session["resultTruyenThong"] == "TAI" else "🔵 *XỈU*"
-            msg += (
-                f"📌 *Phiên trước:* `#{latest_id}`\n"
-                f"🎲 *Xúc xắc:* {dice_str}  _{new_session['point']} điểm_\n"
-                f"📋 *Kết quả:* {res_icon}\n"
-            )
-            if match_str:
-                msg += f"🎯 *Đối chiếu:* {match_str}\n"
-
-            msg += (
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🔍 _{detail}_\n"
-                f"⏰ _{time_str}_"
-            )
-
-            chats_for_type = [
-                cid for cid, info in list(active_chats.items())
-                if info.get("type") == game_type
-            ]
-            for chat_id in chats_for_type:
-                try:
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=msg,
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
-                except Exception:
-                    pass
-
-        except Exception:
-            pass
-
-        await asyncio.sleep(5)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    args = context.args
-
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = ctx.args
     if not args or args[0].lower() not in ("md5", "hu"):
         await update.message.reply_text(
-            "📌 *Cách dùng:*\n`/start md5` — Dự đoán LC MD5\n`/start hu` — Dự đoán LC Hũ",
+            "⚠️ *Cú pháp:* `/start md5` hoặc `/start hu`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    gt = args[0].lower()
-    active_chats[chat_id] = {"type": gt}
+    game = args[0].lower()
+    st = STATE[game]
 
-    msg = (
-        f"✅ {game_label(gt)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🚀 *Đã bắt đầu dự đoán tự động*\n"
-        f"🔄 _Cập nhật mỗi khi có phiên mới_\n"
-        f"📡 _Đang chờ phiên tiếp theo..._\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚙️ /stop — dừng · /hoc — nâng cấp · /his — lịch sử"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    if chat_id not in active_chats:
+    if st["running"]:
         await update.message.reply_text(
-            "⚠️ _Bạn chưa bắt đầu dự đoán._", parse_mode=ParseMode.MARKDOWN
+            f"⚡ {GAME_LABEL[game]} *đang chạy rồi!*",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    gt = active_chats.pop(chat_id)["type"]
-    correct = correct_count[gt]
-    wrong = wrong_count[gt]
-    total = correct + wrong
-    acc = correct / total if total > 0 else 0
+    st["running"] = True
+    st["chat_id"] = update.effective_chat.id
+    st["last_id"] = None
+    st["pending"] = None
+    st["correct"] = 0
+    st["wrong"]   = 0
+    st["weights"] = default_weights()
+    st["history"].clear()
+    st["preds"].clear()
 
-    msg = (
-        f"🛑 {game_label(gt)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✋ *Đã dừng dự đoán*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ *Đoán đúng:* `{correct}`\n"
-        f"❌ *Sai:* `{wrong}`\n"
-        f"🎯 *Tỷ lệ:* `{acc:.1%}`"
+    await update.message.reply_text(
+        f"🚀 {GAME_LABEL[game]}\n*Bắt đầu dự đoán tự động...*\n_Đang tải dữ liệu lịch sử..._",
+        parse_mode=ParseMode.MARKDOWN,
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    st["task"] = asyncio.create_task(prediction_loop(ctx.bot, game))
 
 
-async def cmd_hoc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    stopped = []
+    for game, st in STATE.items():
+        if st["running"] and st["chat_id"] == chat_id:
+            st["running"] = False
+            if st["task"]:
+                st["task"].cancel()
+                st["task"] = None
+            stopped.append(game)
 
-    if chat_id not in active_chats:
+    if not stopped:
         await update.message.reply_text(
-            "⚠️ _Vui lòng /start trước._", parse_mode=ParseMode.MARKDOWN
+            "⚠️ *Không có bot nào đang chạy.*",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    gt = active_chats[chat_id]["type"]
-    algo_version[gt] += 1
-    v = algo_version[gt]
-    w = weights[gt]
+    lines = ["🛑 *Đã dừng dự đoán*\n"]
+    for game in stopped:
+        st = STATE[game]
+        total = st["correct"] + st["wrong"]
+        acc = int(st["correct"] / total * 100) if total > 0 else 0
+        lines.append(
+            f"{GAME_LABEL[game]}\n"
+            f"✅ *Đúng:* `{st['correct']}`  ❌ *Sai:* `{st['wrong']}`\n"
+            f"📊 *Tỉ lệ:* `{acc}%`"
+        )
 
-    correct = correct_count[gt]
-    wrong = wrong_count[gt]
-    total = correct + wrong
-    upgrades = []
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
-    if total >= 10:
-        acc = correct / total
-        if acc < 0.50:
-            w["bridge"] = min(0.55, w["bridge"] + 0.05)
-            w["pattern"] = min(0.30, w["pattern"] + 0.05)
-            w["freq"] = max(0.10, w["freq"] - 0.05)
-            w["trend"] = max(0.10, w["trend"] - 0.05)
-            upgrades.append("Tăng trọng số cầu & pattern, giảm tần số")
-        elif acc < 0.60:
-            w["trend"] = min(0.30, w["trend"] + 0.03)
-            w["pattern"] = min(0.30, w["pattern"] + 0.03)
-            upgrades.append("Tăng nhẹ xu hướng & pattern")
+
+async def cmd_hoc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    results = []
+    for game, st in STATE.items():
+        preds = list(st["preds"])
+        if len(preds) < 5:
+            continue
+
+        recent = preds[: min(30, len(preds))]
+        acc = sum(1 for p in recent if p["correct"]) / len(recent)
+        w = st["weights"]
+
+        if acc < 0.45:
+            for k in w:
+                w[k] = max(0.3, min(3.0, w[k] + random.uniform(-0.15, 0.25)))
+        elif acc < 0.55:
+            for k in w:
+                w[k] = max(0.3, min(3.0, w[k] + random.uniform(-0.08, 0.15)))
         else:
-            w["freq"] = min(0.30, w["freq"] + 0.03)
-            upgrades.append("Tỷ lệ tốt — tăng nhẹ trọng số tần số")
-    else:
-        upgrades.append("Chưa đủ dữ liệu — giữ trọng số mặc định")
+            for k in w:
+                w[k] = max(0.3, min(3.0, w[k] * random.uniform(0.97, 1.07)))
 
-    upgrades.append(f"Phát hiện cầu gãy nhạy hơn (v{v})")
-    upgrades.append(f"Pattern matching mở rộng {min(8, 6 + v)} phiên")
+        top3 = sorted(w.items(), key=lambda x: x[1], reverse=True)[:3]
+        top_str = "\n".join(
+            f"  • _{ALGO_NAME_VN.get(k, k)}_ → `{v:.2f}`" for k, v in top3
+        )
 
-    detail_str = "\n".join(f"  • _{u}_" for u in upgrades)
+        results.append(
+            f"{GAME_LABEL[game]}\n"
+            f"📚 *Chính xác gần đây:* `{int(acc * 100)}%`\n"
+            f"🔧 *Thuật toán mạnh nhất:*\n{top_str}"
+        )
 
-    msg = (
-        f"🧠 {game_label(gt)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ *Đã học tập — Nâng cấp v{v}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚙️ *Thuật toán nâng cấp:*\n{detail_str}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 *Trọng số mới:*\n"
-        f"  🔗 Cầu: `{w['bridge']:.0%}`\n"
-        f"  📈 Xu hướng: `{w['trend']:.0%}`\n"
-        f"  🔁 Pattern: `{w['pattern']:.0%}`\n"
-        f"  📊 Tần số: `{w['freq']:.0%}`"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_his(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    if chat_id not in active_chats:
+    if not results:
         await update.message.reply_text(
-            "⚠️ _Vui lòng /start trước._", parse_mode=ParseMode.MARKDOWN
+            "⚠️ *Chưa đủ dữ liệu để học.*\nChạy thêm nhiều phiên để tích lũy!",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    gt = active_chats[chat_id]["type"]
-    hist = pred_history[gt]
+    await update.message.reply_text(
+        "🧠 *Đã học tập & nâng cấp thuật toán!*\n\n" + "\n\n".join(results),
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
-    if not hist:
+
+async def cmd_his(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    lines = []
+    for game, st in STATE.items():
+        preds = list(st["preds"])
+        if not preds:
+            continue
+        lines.append(f"{GAME_LABEL[game]}")
+        lines.append("`Phiên      Dự Đoán  KQ      Kết`")
+        lines.append("`" + "─" * 34 + "`")
+        for p in preds[:20]:
+            pd = "TÀI " if p["pred"]   == "TAI" else "XỈU "
+            ac = "TÀI " if p["actual"] == "TAI" else "XỈU "
+            rs = "✅" if p["correct"] else "❌"
+            lines.append(f"`{str(p['id']):<10} {pd:<9}{ac:<8}` {rs}")
+        lines.append("")
+
+    if not lines:
         await update.message.reply_text(
-            "📭 _Chưa có lịch sử dự đoán._", parse_mode=ParseMode.MARKDOWN
+            "⚠️ *Chưa có lịch sử dự đoán.*",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    rows = []
-    for entry in hist[-20:]:
-        icon = "✅" if entry["correct"] else "❌"
-        act = "🔴TÀI" if entry["actual"] == "TAI" else "🔵XỈU"
-        prd = "🔴TÀI" if entry["predicted"] == "TAI" else "🔵XỈU"
-        rows.append(f"`#{entry['session_id']}` │ {act} │ {prd} {icon}")
-
-    correct = correct_count[gt]
-    wrong = wrong_count[gt]
-    total = correct + wrong
-    acc = correct / total if total > 0 else 0
-
-    history_str = "\n".join(rows)
-    msg = (
-        f"📜 {game_label(gt)} — *Lịch sử dự đoán*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"`Phiên        │ Kết quả │ Dự đoán`\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{history_str}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ *Đúng:* `{correct}` · ❌ *Sai:* `{wrong}` · 🎯 `{acc:.1%}`"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-
-async def post_init(application: Application):
-    asyncio.create_task(polling_loop(application, "md5"))
-    asyncio.create_task(polling_loop(application, "hu"))
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 def main():
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("hoc", cmd_hoc))
-    app.add_handler(CommandHandler("his", cmd_his))
-
+    app.add_handler(CommandHandler("stop",  cmd_stop))
+    app.add_handler(CommandHandler("hoc",   cmd_hoc))
+    app.add_handler(CommandHandler("his",   cmd_his))
+    print("✅ Bot đang chạy...")
     app.run_polling(drop_pending_updates=True)
 
 
