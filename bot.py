@@ -7,7 +7,7 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-BOT_TOKEN = "8778249747:AAFnLZeDZYuRXVyjJrdQqIndezMe7-kHGs0"
+BOT_TOKEN = "8778249747:AAFAjVSGVB-OWcOZdFYWCQA0ge2xwMEdNWs"
 
 API_URLS = {
     "md5": "https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412",
