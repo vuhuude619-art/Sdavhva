@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Bot dự đoán Tài Xỉu siêu AI - Nâng cấp toàn diện
+Bot dự đoán Tài Xỉu siêu AI - Nâng cấp toàn diện V2
 - Thuật toán thông minh, tự học, đa sàn LC79 & BetVip
+- Phân tích 16 phiên gần nhất, tần suất điểm, xu hướng, các mẫu cầu
 - Quản lý key, thanh toán, broadcast, ban/unban, CSKH
 - Bảo trì, antispam, log học tập, thống kê thu nhập
 - Xử lý lỗi triệt để, chạy ổn định 24/7
@@ -18,7 +19,7 @@ import signal
 import sys
 import time
 import traceback
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime
 from typing import Optional, Dict, List, Any, Tuple
 
@@ -105,19 +106,26 @@ DEFAULT_ALGO_WEIGHTS = {
     "pattern8": 1.5, "entropy": 1.0, "momentum": 1.1,
     "cau_lap": 1.4, "cham_dinh": 1.4, "point_analysis": 1.2,
     "complex_pattern": 1.5, "reverse_momentum": 1.0,
+    "trend_16": 1.8, "point_frequency": 1.3, "peak_bottom": 1.6,
+    "cau_2_1_1_2": 1.7, "symmetry": 1.4, "rolling_avg": 1.2,
+    "advanced_momentum": 1.3, "cycle_2_2": 1.5,
 }
 
 ALGO_NAMES = {
-    "streak": "Cầu bệt", "break_detect": "Cầu bẻ", "pingpong": "Cầu 1-1",
-    "pairs": "Cầu 2-2", "zigzag": "Cầu đảo", "freq20": "Tần suất 20",
+    "streak": "Cầu bệt", "break_detect": "Bẻ cầu", "pingpong": "Cầu 1-1",
+    "pairs": "Cầu 2-2", "zigzag": "Cầu đảo chiều", "freq20": "Tần suất 20",
     "freq50": "Tần suất 50", "freq100": "Tần suất 100", "point_trend": "Xu hướng điểm",
     "peak": "Chạm đỉnh", "pattern6": "Mẫu 6", "pattern7": "Mẫu 7",
     "pattern8": "Mẫu 8", "entropy": "Hỗn loạn", "momentum": "Quán tính",
     "cau_lap": "Cầu lặp", "cham_dinh": "Chạm định", "point_analysis": "Phân tích điểm",
     "complex_pattern": "Mẫu phức", "reverse_momentum": "Đảo quán tính",
+    "trend_16": "Xu hướng 16 phiên", "point_frequency": "Tần suất điểm",
+    "peak_bottom": "Đỉnh/đáy", "cau_2_1_1_2": "Cầu 2-1-1-2",
+    "symmetry": "Đối xứng", "rolling_avg": "Trung bình trượt",
+    "advanced_momentum": "Quán tính nâng cao", "cycle_2_2": "Chu kỳ 2-2",
 }
 
-RECENT_WINDOW = 50
+RECENT_WINDOW = 16  # Cửa sổ phân tích nhanh
 MAX_SESSION_HISTORY = 500
 WEIGHT_MIN = 0.3
 WEIGHT_MAX = 3.0
@@ -171,6 +179,17 @@ async def init_db():
             reason TEXT, timestamp REAL NOT NULL,
             user_id INTEGER, algo_votes TEXT
         )""",
+        """CREATE TABLE IF NOT EXISTS patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_game TEXT NOT NULL,
+            pattern_type TEXT NOT NULL,
+            start_session_id INTEGER,
+            end_session_id INTEGER,
+            length INTEGER,
+            result_sequence TEXT,
+            confidence REAL,
+            created REAL
+        )""",
         """CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, username TEXT,
             full_name TEXT, banned INTEGER DEFAULT 0,
@@ -211,6 +230,7 @@ async def init_db():
         "CREATE INDEX IF NOT EXISTS idx_sess_sg ON sessions(site_game, session_id)",
         "CREATE INDEX IF NOT EXISTS idx_pred_sg ON predictions(site_game, session_id)",
         "CREATE INDEX IF NOT EXISTS idx_pred_uid ON predictions(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_patterns_sg ON patterns(site_game)",
     ]
     for stmt in tables:
         await db.execute(stmt)
@@ -334,7 +354,7 @@ def _safe_json(val, default):
     except:
         return default
 
-# ---------------------------- AI ENGINE ---------------------------------
+# ---------------------------- AI ENGINE (NÂNG CẤP) --------------------
 class AIEngine:
     def __init__(self):
         self.weights = defaultdict(lambda: DEFAULT_ALGO_WEIGHTS.copy())
@@ -363,7 +383,28 @@ class AIEngine:
         except Exception as e:
             logger.warning(f"save_weights error {site_game}: {e}")
 
-    # ------------------------- ALGORITHMS -----------------------------
+    # ------------------------- ALGORITHMS (đầy đủ) ---------------------
+    def algo_streak(self, history):
+        if len(history) < 3:
+            return None, 0
+        last = history[0]["result"]
+        streak = 1
+        for i in range(1, len(history)):
+            if history[i]["result"] == last:
+                streak += 1
+            else:
+                break
+        if streak < 3:
+            return None, 0
+        return last, min(78, 44 + streak * 4)
+
+    def algo_break_detect(self, history):
+        last, s = self._streak_info(history)
+        if s >= 5:
+            opp = "XIU" if last == "TAI" else "TAI"
+            return opp, min(82, 54 + (s - 5) * 5)
+        return None, 0
+
     @staticmethod
     def _streak_info(history):
         if not history:
@@ -376,19 +417,6 @@ class AIEngine:
             else:
                 break
         return last, streak
-
-    def algo_streak(self, history):
-        last, s = self._streak_info(history)
-        if s < 3:
-            return None, 0
-        return last, min(68, 44 + s * 3)
-
-    def algo_break_detect(self, history):
-        last, s = self._streak_info(history)
-        if s >= 5:
-            opp = "XIU" if last == "TAI" else "TAI"
-            return opp, min(82, 54 + (s - 5) * 5)
-        return None, 0
 
     def algo_pingpong(self, history):
         if len(history) < 4:
@@ -569,6 +597,131 @@ class AIEngine:
             return ("TAI" if p0 < p2 else "XIU"), 66
         return None, 0
 
+    # --- CÁC THUẬT TOÁN MỚI NÂNG CẤP ---
+    def algo_trend_16(self, history):
+        """Phân tích xu hướng 16 phiên gần nhất"""
+        window = history[:RECENT_WINDOW]
+        if len(window) < 16:
+            return None, 0
+        tai = sum(1 for h in window if h["result"] == "TAI")
+        xiu = 16 - tai
+        if tai >= 10:
+            return "TAI", 55 + (tai - 10) * 3
+        if xiu >= 10:
+            return "XIU", 55 + (xiu - 10) * 3
+        # Nếu cân bằng, xét đà tăng/giảm điểm gần đây
+        pts = [h["point"] for h in window[:4]]
+        if all(pts[i] > pts[i+1] for i in range(3)):
+            return "TAI", 58
+        if all(pts[i] < pts[i+1] for i in range(3)):
+            return "XIU", 58
+        return None, 0
+
+    def algo_point_frequency(self, history):
+        """Phân tích tần suất điểm trong 16 phiên"""
+        if len(history) < 16:
+            return None, 0
+        points = [h["point"] for h in history[:16]]
+        counter = Counter(points)
+        total = len(points)
+        # Nếu điểm >= 11 xuất hiện > 50%
+        high_ratio = sum(counter[p] for p in counter if p >= 11) / total
+        low_ratio = sum(counter[p] for p in counter if p <= 7) / total
+        if high_ratio > 0.5:
+            return "XIU", int(60 + high_ratio * 20)
+        if low_ratio > 0.5:
+            return "TAI", int(60 + low_ratio * 20)
+        return None, 0
+
+    def algo_peak_bottom(self, history):
+        """Chạm đỉnh/đáy cục bộ"""
+        if len(history) < 5:
+            return None, 0
+        pts = [h["point"] for h in history[:5]]
+        max_pt = max(pts)
+        min_pt = min(pts)
+        if max_pt >= 17:  # Đỉnh cao
+            return "XIU", 75
+        if min_pt <= 4:   # Đáy thấp
+            return "TAI", 75
+        # Đỉnh/đáy nhẹ
+        if pts[0] >= 15 and pts[1] < pts[0] and pts[2] < pts[0]:
+            return "XIU", 68
+        if pts[0] <= 5 and pts[1] > pts[0] and pts[2] > pts[0]:
+            return "TAI", 68
+        return None, 0
+
+    def algo_cau_2_1_1_2(self, history):
+        """Mẫu cầu 2-1-1-2"""
+        if len(history) < 8:
+            return None, 0
+        seq = [h["result"] for h in history[:8]]
+        # Kiểm tra mẫu 2 TÀI - 1 XỈU - 1 TÀI - 2 XỈU
+        if seq[:2] == ["TAI","TAI"] and seq[2]=="XIU" and seq[3]=="TAI" and seq[4:6]==["XIU","XIU"]:
+            return "TAI", 72  # Dự đoán tiếp tục chu kỳ: TAI
+        if seq[:2] == ["XIU","XIU"] and seq[2]=="TAI" and seq[3]=="XIU" and seq[4:6]==["TAI","TAI"]:
+            return "XIU", 72
+        # Mẫu ngược
+        if seq[:2] == ["TAI","TAI"] and seq[2]=="XIU" and seq[3]=="XIU" and seq[4:6]==["TAI","TAI"]:
+            return "XIU", 72
+        if seq[:2] == ["XIU","XIU"] and seq[2]=="TAI" and seq[3]=="TAI" and seq[4:6]==["XIU","XIU"]:
+            return "TAI", 72
+        return None, 0
+
+    def algo_symmetry(self, history):
+        """Cầu đối xứng"""
+        if len(history) < 6:
+            return None, 0
+        r = [h["result"] for h in history[:6]]
+        # Đối xứng đơn giản: A B C C B A ?
+        if r[0]==r[5] and r[1]==r[4] and r[2]==r[3] and r[0]!=r[1]:
+            # Dự đoán tiếp tục đối xứng: A
+            return r[0], 78
+        if r[0]==r[4] and r[1]==r[3] and r[0]!=r[1]:
+            return r[0], 72
+        return None, 0
+
+    def algo_rolling_avg(self, history):
+        """Trung bình trượt điểm 3 phiên"""
+        if len(history) < 3:
+            return None, 0
+        avg3 = sum(h["point"] for h in history[:3]) / 3
+        if avg3 > 12.0:
+            return "TAI", 62
+        if avg3 < 9.0:
+            return "XIU", 62
+        return None, 0
+
+    def algo_advanced_momentum(self, history):
+        """Quán tính nâng cao: thay đổi điểm 3 phiên"""
+        if len(history) < 4:
+            return None, 0
+        p = [h["point"] for h in history[:4]]
+        diff = p[0] - p[3]
+        if diff >= 6:
+            return "XIU", 64
+        if diff <= -6:
+            return "TAI", 64
+        return None, 0
+
+    def algo_cycle_2_2(self, history):
+        """Kiểm tra chu kỳ 2-2 rõ ràng hơn"""
+        if len(history) < 8:
+            return None, 0
+        r = [h["result"] for h in history[:8]]
+        # Mẫu T T X X T T X X => tiếp T
+        if r[:2]==["TAI","TAI"] and r[2:4]==["XIU","XIU"] and r[4:6]==["TAI","TAI"] and r[6:8]==["XIU","XIU"]:
+            return "TAI", 78
+        if r[:2]==["XIU","XIU"] and r[2:4]==["TAI","TAI"] and r[4:6]==["XIU","XIU"] and r[6:8]==["TAI","TAI"]:
+            return "XIU", 78
+        # Mẫu 2-2 ngắn hơn
+        if len(r)>=6 and r[:2]==["TAI","TAI"] and r[2:4]==["XIU","XIU"] and r[4]==r[5]=="TAI":
+            return "XIU", 70
+        if len(r)>=6 and r[:2]==["XIU","XIU"] and r[2:4]==["TAI","TAI"] and r[4]==r[5]=="XIU":
+            return "TAI", 70
+        return None, 0
+
+    # Danh sách thuật toán đầy đủ
     ALGORITHMS = [
         ("streak", algo_streak), ("break_detect", algo_break_detect),
         ("pingpong", algo_pingpong), ("pairs", algo_pairs), ("zigzag", algo_zigzag),
@@ -578,9 +731,16 @@ class AIEngine:
         ("entropy", algo_entropy), ("momentum", algo_momentum), ("cau_lap", algo_cau_lap),
         ("cham_dinh", algo_cham_dinh), ("point_analysis", algo_point_analysis),
         ("complex_pattern", algo_complex_pattern), ("reverse_momentum", algo_reverse_momentum),
+        ("trend_16", algo_trend_16), ("point_frequency", algo_point_frequency),
+        ("peak_bottom", algo_peak_bottom), ("cau_2_1_1_2", algo_cau_2_1_1_2),
+        ("symmetry", algo_symmetry), ("rolling_avg", algo_rolling_avg),
+        ("advanced_momentum", algo_advanced_momentum), ("cycle_2_2", algo_cycle_2_2),
     ]
 
-    def predict(self, history: List[Dict], site_game: str) -> Tuple[str, int, str, Dict]:
+    def predict(self, history: List[Dict], site_game: str, patterns_db: List = None) -> Tuple[str, int, str, Dict]:
+        """
+        history: từ mới nhất (index 0) đến cũ dần
+        """
         if len(history) < 2:
             return random.choice(["TAI", "XIU"]), 50, "Không đủ dữ liệu", {}
         weights = self.weights.get(site_game, DEFAULT_ALGO_WEIGHTS)
@@ -608,7 +768,7 @@ class AIEngine:
             winner_ratio = ratio_tai if pred == "TAI" else (1 - ratio_tai)
             conf = int(50 + winner_ratio * 80)
             conf = max(50, min(92, conf))
-        top = sorted([(n, c) for n, p, c, _ in contrib if p == pred], key=lambda x: x[1], reverse=True)[:2]
+        top = sorted([(n, c) for n, p, c, _ in contrib if p == pred], key=lambda x: x[1], reverse=True)[:3]
         reason = " + ".join(f"{ALGO_NAMES.get(n,n)} ({c}%)" for n,c in top) if top else "Tổng hợp"
         votes = {name: {"pred": p, "conf": c, "weighted": round(w,4)} for name,p,c,w in contrib}
         return pred, conf, reason, votes
@@ -624,7 +784,7 @@ class AIEngine:
             await db.commit()
         except Exception as e:
             logger.warning(f"learn DB error: {e}")
-        # update weights
+        # Cập nhật trọng số
         try:
             cur_w = self.weights.get(site_game, DEFAULT_ALGO_WEIGHTS.copy())
             for algo_name, info in algo_votes.items():
@@ -636,6 +796,38 @@ class AIEngine:
             await self.save_weights_to_db(site_game)
         except Exception as e:
             logger.warning(f"learn weight update error: {e}")
+
+    async def detect_and_save_patterns(self, site_game: str, history: List[Dict]):
+        """Phân tích và lưu các mẫu cầu vào DB"""
+        if len(history) < 6:
+            return
+        r = [h["result"] for h in history[:min(50, len(history))]]
+        sid = history[0]["id"]
+        try:
+            # Cầu bệt
+            last, streak = self._streak_info(history)
+            if streak >= 4:
+                await db.execute(
+                    "INSERT INTO patterns (site_game, pattern_type, start_session_id, end_session_id, length, result_sequence, confidence, created) VALUES (?,?,?,?,?,?,?,?)",
+                    (site_game, "streak", sid, sid - streak + 1, streak, ",".join(r[:streak]), 0.8, time.time()))
+            # Cầu 1-1
+            if len(r) >= 6 and all(r[i] != r[i+1] for i in range(5)):
+                await db.execute(
+                    "INSERT INTO patterns (site_game, pattern_type, start_session_id, end_session_id, length, result_sequence, confidence, created) VALUES (?,?,?,?,?,?,?,?)",
+                    (site_game, "1-1", sid, sid - 5, 6, ",".join(r[:6]), 0.9, time.time()))
+            # Cầu 2-2
+            if len(r) >= 6 and r[0]==r[1]==r[2] and r[3]==r[4]==r[5] and r[0]!=r[3]:
+                await db.execute(
+                    "INSERT INTO patterns (site_game, pattern_type, start_session_id, end_session_id, length, result_sequence, confidence, created) VALUES (?,?,?,?,?,?,?,?)",
+                    (site_game, "2-2", sid, sid - 5, 6, ",".join(r[:6]), 0.85, time.time()))
+            # Cầu đối xứng
+            if len(r) >= 6 and r[0]==r[5] and r[1]==r[4] and r[2]==r[3]:
+                await db.execute(
+                    "INSERT INTO patterns (site_game, pattern_type, start_session_id, end_session_id, length, result_sequence, confidence, created) VALUES (?,?,?,?,?,?,?,?)",
+                    (site_game, "symmetry", sid, sid - 5, 6, ",".join(r[:6]), 0.88, time.time()))
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"detect_and_save_patterns error: {e}")
 
 # ---------------------------- BACKGROUND TASK -------------------------
 async def background_fetch_and_learn(bot: Bot):
@@ -687,24 +879,26 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
         return
     await clean_old_sessions(game_key)
     async with db.execute(
-        "SELECT result, dices, point FROM sessions WHERE site_game=? ORDER BY session_id DESC LIMIT 200",
+        "SELECT session_id, result, dices, point FROM sessions WHERE site_game=? ORDER BY session_id DESC LIMIT 200",
         (game_key,)
     ) as cur:
         rows = await cur.fetchall()
     if not rows:
         return
-    history = [{"result": r[0], "dices": _safe_json(r[1], []), "point": r[2] or 0} for r in rows]
-    # check pending prediction for previous session
+    history = [{"id": r[0], "result": r[1], "dices": _safe_json(r[2], []), "point": r[3] or 0} for r in rows]
+    # Lưu pattern mới phát hiện
+    await ai_engine.detect_and_save_patterns(game_key, history)
+    # Kiểm tra dự đoán cũ (phiên trước)
     async with db.execute(
         "SELECT id, predicted, confidence, algo_votes FROM predictions WHERE site_game=? AND session_id=? AND actual IS NULL ORDER BY id DESC LIMIT 1",
         (game_key, latest_id - 1)
     ) as cur:
         pending = await cur.fetchone()
     if pending:
-        actual = history[0]["result"]
+        actual = history[0]["result"]  # result của phiên mới nhất hiện tại
         algo_votes = _safe_json(pending[3], {})
         await ai_engine.learn_from_outcome(game_key, latest_id - 1, pending[1], actual, pending[2], algo_votes)
-    # predict next session
+    # Dự đoán phiên tiếp theo (latest_id + 1)
     pred, conf, reason, votes = ai_engine.predict(history, game_key)
     try:
         await db.execute(
@@ -714,7 +908,7 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
         await db.commit()
     except Exception as e:
         logger.warning(f"Insert prediction error {game_key}: {e}")
-    # broadcast to watchers
+    # Broadcast cho người theo dõi
     watchers = list(user_watches.get(game_key, []))
     if not watchers:
         return
@@ -1293,7 +1487,6 @@ async def admin_editkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     key, old_days, created = key_info
     new_days = old_days + add_days
-    # Tạo key mới với số ngày mới
     new_key = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=16))
     now = time.time()
     await db.execute("INSERT OR REPLACE INTO keys (key, days, created, created_by) VALUES (?,?,?,?)", (new_key, new_days, now, update.effective_user.id))
@@ -1318,7 +1511,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     global ai_engine
     setup_logging()
-    logger.info("Starting bot...")
+    logger.info("Starting bot V2...")
     await init_db()
     ai_engine = AIEngine()
     await ai_engine.load_weights_from_db()
@@ -1366,7 +1559,7 @@ async def main():
             await app.start()
             await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
             bg_task = asyncio.create_task(background_fetch_and_learn(app.bot))
-            logger.info("✅ Bot đang chạy. Ctrl+C để dừng.")
+            logger.info("✅ Bot V2 đang chạy. Ctrl+C để dừng.")
             loop = asyncio.get_running_loop()
             def stop_handler(*_):
                 _shutdown_event.set()
