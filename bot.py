@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Bot dự đoán Tài Xỉu siêu AI - Nâng cấp toàn diện V2
-- Thuật toán thông minh, tự học, đa sàn LC79 & BetVip
-- Phân tích 16 phiên gần nhất, tần suất điểm, xu hướng, các mẫu cầu
+Bot dự đoán Tài Xỉu siêu AI - Nâng cấp toàn diện V3
+- Giao diện dự đoán mới, hiển thị cầu gần đây
+- Lịch sử dự đoán cá nhân chính xác
+- Nâng cấp thuật toán AI: đa dạng, tự điều chỉnh trọng số theo từng sàn
 - Quản lý key, thanh toán, broadcast, ban/unban, CSKH
 - Bảo trì, antispam, log học tập, thống kê thu nhập
 - Xử lý lỗi triệt để, chạy ổn định 24/7
@@ -109,7 +110,6 @@ DEFAULT_ALGO_WEIGHTS = {
     "trend_16": 1.8, "point_frequency": 1.3, "peak_bottom": 1.6,
     "cau_2_1_1_2": 1.7, "symmetry": 1.4, "rolling_avg": 1.2,
     "advanced_momentum": 1.3, "cycle_2_2": 1.5,
-    # New advanced algorithms
     "oscillation": 1.2, "sum_parity": 1.0, "fibonacci": 1.3,
     "double_streak": 1.4, "martingale_signal": 1.1,
     "cross_over": 1.2
@@ -132,7 +132,7 @@ ALGO_NAMES = {
     "martingale_signal": "Tín hiệu Martingale", "cross_over": "Giao cắt trung bình"
 }
 
-RECENT_WINDOW = 16  # Cửa sổ phân tích nhanh
+RECENT_WINDOW = 16
 MAX_SESSION_HISTORY = 500
 WEIGHT_MIN = 0.3
 WEIGHT_MAX = 3.0
@@ -143,6 +143,7 @@ WEIGHT_DEC = 0.97
 db = None
 ai_engine = None
 user_watches = defaultdict(list)
+active_chats = {}  # CSKH chat
 _shutdown_event = asyncio.Event()
 logger = logging.getLogger("txbot")
 
@@ -361,7 +362,15 @@ def _safe_json(val, default):
     except:
         return default
 
-# ---------------------------- AI ENGINE (NÂNG CẤP V3) --------------------
+# ---------------------------- TYPING MIDDLEWARE -----------------------
+async def typing_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if update.effective_message and update.effective_user and update.effective_chat:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    except:
+        pass
+
+# ---------------------------- AI ENGINE ---------------------------------
 class AIEngine:
     def __init__(self):
         self.weights = defaultdict(lambda: DEFAULT_ALGO_WEIGHTS.copy())
@@ -390,96 +399,7 @@ class AIEngine:
         except Exception as e:
             logger.warning(f"save_weights error {site_game}: {e}")
 
-    # ------------------------- NEW ALGORITHMS -------------------------
-    def algo_oscillation(self, history):
-        """Dao động điểm quanh 10.5 - nếu điểm dao động mạnh thì dự đoán xu hướng quay về"""
-        if len(history) < 4:
-            return None, 0
-        pts = [h["point"] for h in history[:4]]
-        avg = sum(pts) / len(pts)
-        if all(p >= 12 for p in pts):
-            return "XIU", 72
-        if all(p <= 9 for p in pts):
-            return "TAI", 72
-        if max(pts) - min(pts) >= 8:
-            # dao động lớn, có thể đảo chiều
-            return "TAI" if pts[0] < 10.5 else "XIU", 65
-        return None, 0
-
-    def algo_sum_parity(self, history):
-        """Chẵn lẻ tổng điểm - nếu 3 phiên gần nhất cùng chẵn hoặc cùng lẻ -> dự đoán đảo"""
-        if len(history) < 3:
-            return None, 0
-        parities = [h["point"] % 2 for h in history[:3]]
-        if all(p == 0 for p in parities):
-            return "TAI", 58  # tổng chẵn thường ra tài? (tùy chỉnh)
-        if all(p == 1 for p in parities):
-            return "XIU", 58
-        return None, 0
-
-    def algo_fibonacci(self, history):
-        """Chu kỳ Fibonacci: tìm mẫu lặp theo các khoảng 2,3,5,8 phiên"""
-        if len(history) < 10:
-            return None, 0
-        r = [h["result"] for h in history[:min(34, len(history))]]
-        def check_cycle(k):
-            if len(r) < 2*k:
-                return None
-            pattern = r[:k]
-            matches = 0
-            for i in range(k, len(r)-k+1, k):
-                if r[i:i+k] == pattern:
-                    matches += 1
-                else:
-                    break
-            if matches >= 2:
-                next_idx = (matches+1) * k
-                if next_idx < len(r):
-                    return r[next_idx]
-            return None
-        for cycle in [2,3,5,8]:
-            pred = check_cycle(cycle)
-            if pred:
-                return pred, 68
-        return None, 0
-
-    def algo_double_streak(self, history):
-        """Cầu bệt kép: 2 Tài - 2 Xỉu luân phiên"""
-        if len(history) < 6:
-            return None, 0
-        r = [h["result"] for h in history[:8]]
-        if len(r) >= 6:
-            if r[0]==r[1] and r[2]==r[3] and r[4]==r[5] and r[0]!=r[2] and r[2]==r[4]:
-                return r[0], 76
-            if r[0]==r[1] and r[2]==r[3] and r[0]!=r[2] and len(r)>=7 and r[4]==r[5]==r[6] and r[4]==r[2]:
-                return r[0], 72
-        return None, 0
-
-    def algo_martingale_signal(self, history):
-        """Tín hiệu martingale: nếu 3 phiên liên tiếp cùng kết quả, khả năng gãy cao"""
-        last, s = self._streak_info(history)
-        if s >= 5:
-            opp = "XIU" if last == "TAI" else "TAI"
-            return opp, 80
-        if s == 4:
-            opp = "XIU" if last == "TAI" else "TAI"
-            return opp, 70
-        return None, 0
-
-    def algo_cross_over(self, history):
-        """Giao cắt trung bình điểm 3 phiên và 7 phiên"""
-        if len(history) < 7:
-            return None, 0
-        pts = [h["point"] for h in history[:7]]
-        ma3 = sum(pts[:3]) / 3
-        ma7 = sum(pts) / 7
-        if ma3 > ma7 + 1.5:
-            return "TAI", 63
-        if ma3 < ma7 - 1.5:
-            return "XIU", 63
-        return None, 0
-
-    # --- Original algorithms (kept as is) ---
+    # ------------------------- ALGORITHMS (đầy đủ) ---------------------
     def algo_streak(self, history):
         if len(history) < 3:
             return None, 0
@@ -799,7 +719,87 @@ class AIEngine:
             return "TAI", 70
         return None, 0
 
-    # Tổng hợp tất cả thuật toán
+    def algo_oscillation(self, history):
+        if len(history) < 4:
+            return None, 0
+        pts = [h["point"] for h in history[:4]]
+        if all(p >= 12 for p in pts):
+            return "XIU", 72
+        if all(p <= 9 for p in pts):
+            return "TAI", 72
+        if max(pts) - min(pts) >= 8:
+            return "TAI" if pts[0] < 10.5 else "XIU", 65
+        return None, 0
+
+    def algo_sum_parity(self, history):
+        if len(history) < 3:
+            return None, 0
+        parities = [h["point"] % 2 for h in history[:3]]
+        if all(p == 0 for p in parities):
+            return "TAI", 58
+        if all(p == 1 for p in parities):
+            return "XIU", 58
+        return None, 0
+
+    def algo_fibonacci(self, history):
+        if len(history) < 10:
+            return None, 0
+        r = [h["result"] for h in history[:min(34, len(history))]]
+        def check_cycle(k):
+            if len(r) < 2*k:
+                return None
+            pattern = r[:k]
+            matches = 0
+            for i in range(k, len(r)-k+1, k):
+                if r[i:i+k] == pattern:
+                    matches += 1
+                else:
+                    break
+            if matches >= 2:
+                next_idx = (matches+1) * k
+                if next_idx < len(r):
+                    return r[next_idx]
+            return None
+        for cycle in [2,3,5,8]:
+            pred = check_cycle(cycle)
+            if pred:
+                return pred, 68
+        return None, 0
+
+    def algo_double_streak(self, history):
+        if len(history) < 6:
+            return None, 0
+        r = [h["result"] for h in history[:8]]
+        if len(r) >= 6:
+            if r[0]==r[1] and r[2]==r[3] and r[4]==r[5] and r[0]!=r[2] and r[2]==r[4]:
+                return r[0], 76
+            if r[0]==r[1] and r[2]==r[3] and r[0]!=r[2] and len(r)>=7 and r[4]==r[5]==r[6] and r[4]==r[2]:
+                return r[0], 72
+        return None, 0
+
+    def algo_martingale_signal(self, history):
+        last, s = self._streak_info(history)
+        if s >= 5:
+            opp = "XIU" if last == "TAI" else "TAI"
+            return opp, 80
+        if s == 4:
+            opp = "XIU" if last == "TAI" else "TAI"
+            return opp, 70
+        return None, 0
+
+    def algo_cross_over(self, history):
+        if len(history) < 7:
+            return None, 0
+        pts = [h["point"] for h in history[:7]]
+        ma3 = sum(pts[:3]) / 3
+        ma7 = sum(pts) / 7
+        if ma3 > ma7 + 1.5:
+            return "TAI", 63
+        if ma3 < ma7 - 1.5:
+            return "XIU", 63
+        return None, 0
+
+    # Danh sách thuật toán đầy đủ
     ALGORITHMS = [
         ("streak", algo_streak), ("break_detect", algo_break_detect),
         ("pingpong", algo_pingpong), ("pairs", algo_pairs), ("zigzag", algo_zigzag),
@@ -813,13 +813,12 @@ class AIEngine:
         ("peak_bottom", algo_peak_bottom), ("cau_2_1_1_2", algo_cau_2_1_1_2),
         ("symmetry", algo_symmetry), ("rolling_avg", algo_rolling_avg),
         ("advanced_momentum", algo_advanced_momentum), ("cycle_2_2", algo_cycle_2_2),
-        # New ones
         ("oscillation", algo_oscillation), ("sum_parity", algo_sum_parity),
         ("fibonacci", algo_fibonacci), ("double_streak", algo_double_streak),
         ("martingale_signal", algo_martingale_signal), ("cross_over", algo_cross_over)
     ]
 
-    def predict(self, history: List[Dict], site_game: str, patterns_db: List = None) -> Tuple[str, int, str, Dict]:
+    def predict(self, history: List[Dict], site_game: str) -> Tuple[str, int, str, Dict]:
         if len(history) < 2:
             return random.choice(["TAI", "XIU"]), 50, "Không đủ dữ liệu", {}
         weights = self.weights.get(site_game, DEFAULT_ALGO_WEIGHTS)
@@ -852,13 +851,7 @@ class AIEngine:
         votes = {name: {"pred": p, "conf": c, "weighted": round(w,4)} for name,p,c,w in contrib}
         return pred, conf, reason, votes
 
-    async def learn_from_outcome(self, site_game: str, session_id: int, predicted: str, actual: str,
-                                 confidence: int, algo_votes: Dict):
-        try:
-            correct = 1 if predicted == actual else 0
-            # Không cần insert, vì đã có bản ghi trước đó, chỉ cập nhật weight
-        except Exception as e:
-            logger.warning(f"learn DB error: {e}")
+    async def learn_from_outcome(self, site_game: str, predicted: str, actual: str, algo_votes: Dict):
         try:
             cur_w = self.weights.get(site_game, DEFAULT_ALGO_WEIGHTS.copy())
             for algo_name, info in algo_votes.items():
@@ -948,7 +941,6 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
         return
     await clean_old_sessions(game_key)
 
-    # Lấy lịch sử
     async with db.execute(
         "SELECT session_id, result, dices, point FROM sessions WHERE site_game=? ORDER BY session_id DESC LIMIT 200",
         (game_key,)
@@ -958,10 +950,9 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
         return
     history = [{"id": r[0], "result": r[1], "dices": _safe_json(r[2], []), "point": r[3] or 0} for r in rows]
 
-    # Lưu pattern mới
     await ai_engine.detect_and_save_patterns(game_key, history)
 
-    # Cập nhật kết quả cho dự đoán cũ (phiên hiện tại = latest_id)
+    # Cập nhật kết quả thực tế cho dự đoán cũ (phiên hiện tại = latest_id)
     async with db.execute(
         "SELECT id, predicted, confidence, algo_votes FROM predictions WHERE site_game=? AND session_id=? AND actual IS NULL ORDER BY id DESC LIMIT 1",
         (game_key, latest_id)
@@ -974,11 +965,10 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
                          (actual, correct, game_key, latest_id))
         await db.commit()
         algo_votes = _safe_json(pending[3], {})
-        await ai_engine.learn_from_outcome(game_key, latest_id, pending[1], actual, pending[2], algo_votes)
+        await ai_engine.learn_from_outcome(game_key, pending[1], actual, algo_votes)
 
     # Dự đoán phiên kế tiếp
     pred, conf, reason, votes = ai_engine.predict(history, game_key)
-    # Lưu dự đoán chung (phục vụ học)
     try:
         await db.execute(
             "INSERT INTO predictions (site_game, session_id, predicted, confidence, reason, timestamp, algo_votes) VALUES (?,?,?,?,?,?,?)",
@@ -988,7 +978,6 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
     except Exception as e:
         logger.warning(f"Insert prediction error {game_key}: {e}")
 
-    # Broadcast nếu có người theo dõi
     watchers = list(user_watches.get(game_key, []))
     if not watchers:
         return
@@ -998,8 +987,8 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
     pred_emoji = "🔴 TÀI" if pred == "TAI" else "🔵 XỈU"
     res_emoji = "🔴 TÀI" if last["result"] == "TAI" else "🔵 XỈU"
 
-    # Chuỗi cầu gần đây (10 phiên, cũ -> mới)
-    recent_10 = [h["result"] for h in history[:10]][::-1]  # đảo ngược để cũ -> mới
+    # Chuỗi cầu 10 phiên gần nhất (cũ -> mới)
+    recent_10 = [h["result"] for h in history[:10]][::-1]
     recent_str = " → ".join(["🔴" if r == "TAI" else "🔵" for r in recent_10])
 
     msg = (
@@ -1023,7 +1012,7 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
             break
         if await is_user_valid(uid):
             if await safe_send(bot, uid, msg, parse_mode=ParseMode.MARKDOWN):
-                # Lưu lịch sử riêng cho user
+                # Lưu lịch sử cá nhân
                 try:
                     await db.execute(
                         "INSERT INTO predictions (site_game, session_id, predicted, confidence, reason, timestamp, algo_votes, user_id) VALUES (?,?,?,?,?,?,?,?)",
@@ -1178,7 +1167,6 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     try:
-        # Lấy lịch sử cá nhân
         async with db.execute(
             "SELECT p.site_game, p.session_id, p.predicted, p.actual, p.correct, p.timestamp "
             "FROM predictions p WHERE p.user_id=? ORDER BY p.id DESC LIMIT 15", (uid,)
@@ -1269,9 +1257,47 @@ async def buy_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-# ---------------------------- CSKH -------------------------------------
-active_chats = {}  # user_id <-> cskh_id
+# ---------------------------- ADMIN APPROVE ----------------------------
+async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    if not is_admin(query.from_user.id):
+        await query.answer("Không có quyền!", show_alert=True)
+        return
+    await query.answer()
+    parts = (query.data or "").split("|")
+    if parts[0] == "approve_pay" and len(parts) >= 4:
+        try:
+            uid = int(parts[1])
+            ts = parts[2]
+            days_str = parts[3]
+            days = int(days_str)
+            amount = PRICE_PLANS.get(days_str, 0)
+        except:
+            await query.edit_message_text("❌ Dữ liệu không hợp lệ")
+            return
+        key = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=16))
+        now = time.time()
+        try:
+            await db.execute("INSERT OR REPLACE INTO keys (key, days, created, created_by) VALUES (?,?,?,?)", (key, days, now, query.from_user.id))
+            await db.execute("INSERT OR REPLACE INTO user_keys (user_id, key, activated) VALUES (?,?,?)", (uid, key, now))
+            await db.execute("INSERT OR REPLACE INTO payments (id, user_id, amount, days, timestamp, status, handled_by) VALUES (?,?,?,?,?,?,?)",
+                             (f"{uid}_{int(now)}", uid, amount, days, now, "approved", query.from_user.id))
+            await db.commit()
+        except Exception as e:
+            logger.error(f"approve_pay DB error: {e}")
+            await query.edit_message_text(f"❌ Lỗi DB: {e}")
+            return
+        expiry = datetime.fromtimestamp(now + days * 86400).strftime("%d/%m/%Y %H:%M")
+        await safe_send(context.bot, uid, f"🎉 *Key đã được kích hoạt!*\n🔑 `{key}`\n📦 Gói: {days} ngày\n⏳ Hết hạn: {expiry}", parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(f"✅ Đã cấp key cho user {uid}: `{key}`", parse_mode=ParseMode.MARKDOWN)
+    elif parts[0] == "reject_pay" and len(parts) >= 2:
+        uid = int(parts[1])
+        await safe_send(context.bot, uid, "❌ Yêu cầu mua key bị từ chối.")
+        await query.edit_message_text(f"❌ Đã từ chối user {uid}")
 
+# ---------------------------- CSKH -------------------------------------
 async def relay_message(bot: Bot, sender_id: int, receiver_id: int, text: str):
     prefix = "📩 Từ CSKH" if sender_id in CSKH_USER_IDS else f"📩 Khách `{sender_id}`"
     await safe_send(bot, receiver_id, f"{prefix}:\n{text}", parse_mode=ParseMode.MARKDOWN)
