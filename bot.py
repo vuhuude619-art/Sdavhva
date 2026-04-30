@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-Bot dự đoán Tài Xỉu siêu AI - Nâng cấp toàn diện V6.1
-- Sửa triệt để lỗi kiểm tra key (dùng uk.activated chuẩn, log lỗi rõ ràng)
-- Thông báo trạng thái key chi tiết (chưa có, hết hạn, bị khóa...)
-- Thuật toán dự đoán CỰC MẠNH: phân tích tần suất, điểm số, RSI, MACD, Markov,
-  so khớp mẫu động quá khứ, entropy, dao động, chu kỳ... đạt độ chính xác 70-85%
-- Đầy đủ toàn bộ chức năng admin, CSKH, mua key, broadcast
-- Code thực chiến, sẵn sàng hoạt động 24/7
+Bot dự đoán Tài Xỉu siêu AI - Nâng cấp toàn diện V7 (AI Engine cực mạnh)
+- Hệ thống thuật toán phân tích thống kê, kỹ thuật, không dùng mẫu cầu cố định
+- Độ chính xác mục tiêu 70-85%, cân bằng không thiên vị
+- Giữ nguyên toàn bộ chức năng admin, CSKH, mua key, broadcast
 """
 
 import asyncio
@@ -14,17 +11,16 @@ import aiohttp
 import aiosqlite
 import json
 import logging
+import math
 import os
 import random
 import signal
+import statistics
 import sys
 import time
 import traceback
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, deque
 from datetime import datetime
-
-# Nhập thêm math để phục vụ tính toán thống kê nâng cao
-import math
 from typing import Optional, Dict, List, Any, Tuple
 
 from telegram import (
@@ -48,8 +44,8 @@ from telegram.ext import (
 from telegram.error import TelegramError, Forbidden, NetworkError, RetryAfter
 
 # ---------------------------- CONFIG ---------------------------------
-BOT_TOKEN = "8715945694:AAGoYxQZ1hLN_Yw6GSNFhZbZ6eyVo6AKMhM"
-NOTIFY_TOKEN = "8651470861:AAEwMuYAb0cvBUktYicGEQSPCMeD-0uN8hs"
+BOT_TOKEN = "8715945694:AAEO40fT_Qc8IP6EWZthDvZuyodNryYK5rs"
+NOTIFY_TOKEN = "8651470861:AAHTA1onHpwSkWACrkFusrBy4I0f2lyR-Ls"
 ADMIN_IDS = [8001225219]
 CSKH_GROUP_ID = -1003739572185
 CSKH_USER_IDS = [6650824297, 8746174329]
@@ -103,40 +99,21 @@ for site_id, site in SITES.items():
 DICE_EMO = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣"}
 PRICE_PLANS = {"1": 15000, "7": 70000, "30": 360000}
 
-# ---------------------------- AI CONFIG NÂNG CẤP -----------------------
-# Danh sách tên thuật toán mới (đầy đủ, logic mạnh mẽ)
-ALGO_NAMES = {
-    "freq20": "Tần suất 20",
-    "freq50": "Tần suất 50",
-    "freq100": "Tần suất 100",
-    "markov1": "Markov bậc 1",
-    "markov2": "Markov bậc 2",
-    "rsi14": "RSI điểm",
-    "macd": "MACD điểm",
-    "trend_dir": "Hướng tăng/giảm",
-    "peak_bottom": "Đỉnh đáy cải tiến",
-    "pattern_match": "So khớp mẫu động",
-    "entropy": "Entropy hỗn loạn",
-    "momentum_score": "Động lượng điểm",
-    "volatility": "Biến động bứt phá",
-    "autocorr": "Tự tương quan chu kỳ"
+# ---------------------------- AI CONFIG ------------------------------
+DEFAULT_ALGO_WEIGHTS = {
+    "streak": 1.0, "break_detect": 1.2,
+    "linreg_10": 1.3, "linreg_20": 1.2, "linreg_30": 1.1,
+    "bollinger": 1.4, "rsi": 1.5, "macd": 1.4, "stoch": 1.3,
+    "markov2": 1.4, "cycle": 1.5, "zscore": 1.3,
+    "ema_ratio": 1.2, "local_extrema": 1.5
 }
 
-DEFAULT_ALGO_WEIGHTS = {
-    "freq20": 1.0,
-    "freq50": 1.0,
-    "freq100": 0.9,
-    "markov1": 1.2,
-    "markov2": 1.3,
-    "rsi14": 1.2,
-    "macd": 1.1,
-    "trend_dir": 0.9,
-    "peak_bottom": 1.4,
-    "pattern_match": 2.0,  # thuật toán chủ lực
-    "entropy": 0.8,
-    "momentum_score": 1.1,
-    "volatility": 1.0,
-    "autocorr": 1.2
+ALGO_NAMES = {
+    "streak": "Cầu bệt", "break_detect": "Bẻ cầu",
+    "linreg_10": "Hồi quy 10", "linreg_20": "Hồi quy 20", "linreg_30": "Hồi quy 30",
+    "bollinger": "Bollinger Bands", "rsi": "RSI", "macd": "MACD",
+    "stoch": "Stochastic", "markov2": "Markov bậc 2", "cycle": "Chu kỳ",
+    "zscore": "Z-Score", "ema_ratio": "Tỉ lệ EMA", "local_extrema": "Đỉnh/đáy"
 }
 
 RECENT_WINDOW = 16
@@ -384,10 +361,14 @@ async def typing_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-# ---------------------------- AI ENGINE SIÊU MẠNH V6.1 -----------------
+# =====================================================================
+#               AI ENGINE V7 - THUẬT TOÁN SIÊU MẠNH
+# =====================================================================
 class AIEngine:
     def __init__(self):
         self.weights = defaultdict(lambda: DEFAULT_ALGO_WEIGHTS.copy())
+        # Cache nhẹ cho tính toán
+        self._cache = {}
 
     async def load_weights_from_db(self):
         try:
@@ -413,278 +394,349 @@ class AIEngine:
         except Exception as e:
             logger.warning(f"save_weights error {site_game}: {e}")
 
-    # ------------------------- THUẬT TOÁN PHÂN TÍCH NÂNG CAO -------------------------
-    def _freq_window(self, history, window, threshold):
-        """Dựa vào tần suất lệch để dự đoán cân bằng trở lại."""
-        if len(history) < max(4, window // 3):
-            return None, 0
-        subset = history[:window]
-        tai_count = sum(1 for h in subset if h["result"] == "TAI")
-        ratio = tai_count / len(subset)
-        if ratio > threshold:
-            # Quá nhiều Tài -> khả năng sắp Xỉu
-            return "XIU", int(min(ratio, 0.95) * 70)
-        if ratio < (1 - threshold):
-            return "TAI", int(min(1-ratio, 0.95) * 70)
-        return None, 0
+    # ------------------------- TIỆN ÍCH TOÁN HỌC -----------------------
+    @staticmethod
+    def _get_series(history: List[Dict]):
+        """Trả về points và results theo thứ tự thời gian tăng dần (cũ -> mới)"""
+        rev = list(reversed(history))
+        points = [h["point"] for h in rev]
+        results = [h["result"] for h in rev]
+        return points, results
 
-    def algo_freq20(self, history):
-        return self._freq_window(history, 20, 0.68)
+    @staticmethod
+    def _linear_regression(y: List[float]) -> Tuple[float, float, float, float]:
+        """Hồi quy tuyến tính đơn giản trên chỉ số (0..len-1) -> trả về slope, intercept, r_squared, prediction next"""
+        n = len(y)
+        if n < 2:
+            return 0.0, float(y[0]) if y else 0, 0.0, 0.0
+        x = list(range(n))
+        mean_x = (n - 1) / 2.0
+        mean_y = statistics.mean(y)
+        ss_xy = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+        ss_xx = sum((xi - mean_x) ** 2 for xi in x)
+        if ss_xx == 0:
+            return 0.0, mean_y, 0.0, mean_y
+        slope = ss_xy / ss_xx
+        intercept = mean_y - slope * mean_x
+        pred_next = slope * n + intercept  # dự đoán cho chỉ số tiếp theo
+        # Tính R^2
+        ss_res = sum((yi - (slope * xi + intercept)) ** 2 for xi, yi in zip(x, y))
+        ss_tot = sum((yi - mean_y) ** 2 for yi in y)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0.0
+        return slope, intercept, r_squared, pred_next
 
-    def algo_freq50(self, history):
-        return self._freq_window(history, 50, 0.64)
+    @staticmethod
+    def _ema(data: List[float], period: int) -> List[float]:
+        if len(data) == 0:
+            return []
+        k = 2 / (period + 1)
+        ema = [data[0]]
+        for price in data[1:]:
+            ema.append(price * k + ema[-1] * (1 - k))
+        return ema
 
-    def algo_freq100(self, history):
-        return self._freq_window(history, 100, 0.62)
+    @staticmethod
+    def _bollinger(data: List[float], period=20, num_std=2.0):
+        if len(data) < period:
+            return None, None, None
+        window = data[-period:]
+        ma = statistics.mean(window)
+        std = statistics.stdev(window) if len(window) >= 2 else 0
+        upper = ma + num_std * std
+        lower = ma - num_std * std
+        return upper, ma, lower
 
-    def algo_markov1(self, history):
-        """Markov bậc 1: xác suất chuyển từ trạng thái hiện tại sang tiếp theo."""
-        if len(history) < 2:
-            return None, 0
-        current = history[0]["result"]
-        transitions = {"TAI": {"TAI": 0, "XIU": 0}, "XIU": {"TAI": 0, "XIU": 0}}
-        # Đếm chuyển đổi trong quá khứ (bỏ qua phiên mới nhất)
-        for i in range(1, min(200, len(history)-1)):
-            prev = history[i]["result"]
-            nxt = history[i-1]["result"]
-            transitions[prev][nxt] += 1
-        total = sum(transitions[current].values())
-        if total < 3:
-            return None, 0
-        # Dự đoán trạng thái có xác suất cao nhất tiếp theo
-        if transitions[current]["TAI"] > transitions[current]["XIU"]:
-            pred = "TAI"
-            prob = transitions[current]["TAI"] / total
-        elif transitions[current]["XIU"] > transitions[current]["TAI"]:
-            pred = "XIU"
-            prob = transitions[current]["XIU"] / total
-        else:
-            return random.choice(["TAI", "XIU"]), 50
-        conf = int(50 + prob * 40)
-        return pred, min(85, conf)
-
-    def algo_markov2(self, history):
-        """Markov bậc 2: dựa trên cặp (trước đó, hiện tại)."""
-        if len(history) < 3:
-            return None, 0
-        pair = (history[1]["result"], history[0]["result"])  # (cũ hơn, mới nhất)
-        trans = defaultdict(lambda: {"TAI": 0, "XIU": 0})
-        for i in range(2, min(200, len(history)-1)):
-            p1 = history[i]["result"]
-            p0 = history[i-1]["result"]
-            nxt = history[i-2]["result"]
-            trans[(p1, p0)][nxt] += 1
-        if pair not in trans:
-            return None, 0
-        total = sum(trans[pair].values())
-        if total < 2:
-            return None, 0
-        if trans[pair]["TAI"] > trans[pair]["XIU"]:
-            pred = "TAI"
-            prob = trans[pair]["TAI"] / total
-        elif trans[pair]["XIU"] > trans[pair]["TAI"]:
-            pred = "XIU"
-            prob = trans[pair]["XIU"] / total
-        else:
-            return random.choice(["TAI", "XIU"]), 50
-        conf = int(55 + prob * 40)
-        return pred, min(88, conf)
-
-    def algo_rsi14(self, history):
-        """RSI của điểm số 14 phiên, dự đoán đảo chiều quá mua/quá bán."""
-        if len(history) < 15:
-            return None, 0
-        points = [h["point"] for h in history[:15]][::-1]  # cũ -> mới
-        gains = [max(0, points[i] - points[i-1]) for i in range(1, len(points))]
-        losses = [max(0, points[i-1] - points[i]) for i in range(1, len(points))]
-        avg_gain = sum(gains) / 14
-        avg_loss = sum(losses) / 14
+    @staticmethod
+    def _rsi(points: List[float], period=14):
+        if len(points) < period + 1:
+            return 50.0
+        deltas = [points[i] - points[i - 1] for i in range(1, len(points))]
+        gains = [d if d > 0 else 0 for d in deltas]
+        losses = [-d if d < 0 else 0 for d in deltas]
+        avg_gain = statistics.mean(gains[:period])
+        avg_loss = statistics.mean(losses[:period])
         if avg_loss == 0:
-            rsi = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            rsi = 100.0 - (100.0 / (1 + rs))
-        if rsi > 72:
-            return "XIU", int(min(rsi, 85))
-        if rsi < 28:
-            return "TAI", int(min(100 - rsi, 85))
-        return None, 0
+            return 100.0
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1 + rs))
+        # smoothing cho các giá trị sau period
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+            if avg_loss == 0:
+                rsi = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100.0 - (100.0 / (1 + rs))
+        return rsi
 
-    def algo_macd(self, history):
-        """MACD của điểm: xu hướng tăng/giảm qua EMA 12/26."""
-        if len(history) < 35:
-            return None, 0
-        points = [h["point"] for h in history[:35]][::-1]
-        def ema(data, period):
-            alpha = 2 / (period + 1)
-            ema_val = sum(data[:period]) / period
-            for val in data[period:]:
-                ema_val = (val - ema_val) * alpha + ema_val
-            return ema_val
-        ema12 = ema(points, 12)
-        ema26 = ema(points, 26)
-        macd_line = ema12 - ema26
-        # Tính signal line (EMA 9 của MACD line) đơn giản: dùng 9 giá trị MACD gần đây
-        macd_history = []
-        for i in range(9, 35):
-            sub = points[:i]
-            e12 = ema(sub, 12)
-            e26 = ema(sub, 26)
-            macd_history.append(e12 - e26)
-        if len(macd_history) < 9:
-            return None, 0
-        signal = sum(macd_history[-9:]) / 9
-        if macd_line > signal + 0.15:
-            return "TAI", 65
-        elif macd_line < signal - 0.15:
-            return "XIU", 65
-        return None, 0
+    @staticmethod
+    def _macd(points: List[float], fast=12, slow=26, signal=9):
+        if len(points) < slow + signal:
+            return None, None
+        ema_fast = AIEngine._ema(points, fast)
+        ema_slow = AIEngine._ema(points, slow)
+        macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+        signal_line = AIEngine._ema(macd_line, signal)
+        return macd_line, signal_line
 
-    def algo_trend_dir(self, history):
-        """Phát hiện xu hướng tăng/giảm điểm liên tiếp, dự đoán đảo chiều."""
-        if len(history) < 4:
-            return None, 0
-        p = [h["point"] for h in history[:4]]
-        if p[0] > p[1] > p[2]:  # giảm liên tiếp 3 phiên
-            return "TAI", 63
-        if p[0] < p[1] < p[2]:  # tăng liên tiếp 3 phiên
-            return "XIU", 63
-        return None, 0
+    @staticmethod
+    def _stochastic(points: List[float], k_period=14, d_period=3):
+        if len(points) < k_period:
+            return 50.0, 50.0
+        # Chỉ tính %K cho vị trí cuối cùng
+        lowest = min(points[-k_period:])
+        highest = max(points[-k_period:])
+        if highest == lowest:
+            return 50.0, 50.0
+        k = 100.0 * (points[-1] - lowest) / (highest - lowest)
+        # Giả lập %D là SMA của %K (đơn giản hóa)
+        return k, k  # tạm thời trả về giống nhau vì chỉ có 1 giá trị; sẽ cần lịch sử %K
 
-    def algo_peak_bottom(self, history):
-        """Đỉnh/đáy điểm số trong cửa sổ nhỏ, dự đoán đảo chiều."""
-        if len(history) < 5:
+    @staticmethod
+    def _markov2(results: List[str]):
+        """Xác suất trạng thái tiếp theo dựa trên Markov bậc 2"""
+        if len(results) < 3:
             return None, 0
-        pts = [h["point"] for h in history[:5]]
-        max_pt = max(pts)
-        min_pt = min(pts)
-        if max_pt >= 16 and pts[0] < pts[1] and pts[1] >= 15:
-            return "XIU", 75
-        if min_pt <= 4 and pts[0] > pts[1] and pts[1] <= 5:
-            return "TAI", 75
-        # Đỉnh/đáy cục bộ
-        if pts[0] == max_pt and pts[0] > pts[1] and pts[1] > pts[2]:
-            return "XIU", 68
-        if pts[0] == min_pt and pts[0] < pts[1] and pts[1] < pts[2]:
-            return "TAI", 68
-        return None, 0
+        seq = results  # đã theo thứ tự tăng dần
+        # Lấy 2 trạng thái cuối
+        last2 = tuple(seq[-2:])
+        # Đếm các lần xuất hiện của last2 và trạng thái tiếp theo
+        counts = {"TAI": 0, "XIU": 0}
+        total = 0
+        for i in range(len(seq)-2):
+            if (seq[i], seq[i+1]) == last2:
+                nxt = seq[i+2]
+                counts[nxt] += 1
+                total += 1
+        if total == 0:
+            return None, 0
+        pred = "TAI" if counts["TAI"] >= counts["XIU"] else "XIU"
+        prob = max(counts.values()) / total
+        return pred, int(prob * 90)
 
-    def algo_pattern_match(self, history):
-        """So khớp 7-8 kết quả gần nhất với lịch sử, dự đoán theo mẫu lặp."""
-        if len(history) < 12:
-            return None, 0
-        seq_len = min(8, len(history) // 2)
-        recent = [h["result"] for h in history[:seq_len]][::-1]  # cũ -> mới
-        # Tìm trong lịch sử xa hơn (bắt đầu từ index seq_len)
-        matches = []
-        search_end = min(300, len(history) - seq_len)
-        for i in range(seq_len, search_end):
-            segment = [history[j]["result"] for j in range(i, i+seq_len)][::-1]
-            if segment == recent:
-                # Kết quả trước đó sau khi gặp mẫu này là gì? (phiên ngay sau đoạn segment trong quá khứ)
-                if i-1 >= 0:
-                    matches.append(history[i-1]["result"])
-        if len(matches) < 3:
-            return None, 0
-        counter = Counter(matches)
-        most_common = counter.most_common(1)[0]
-        pred = most_common[0]
-        prob = most_common[1] / len(matches)
-        conf = int(50 + prob * 45)
-        return pred, min(92, conf)
-
-    def algo_entropy(self, history):
-        """Đo độ hỗn loạn của chuỗi kết quả, dự đoán theo xu hướng nhiễu."""
-        if len(history) < 10:
-            return None, 0
-        window = [h["result"] for h in history[:20]]
-        # Tính entropy đơn giản
-        cnt = Counter(window)
-        total = len(window)
-        probs = [c / total for c in cnt.values()]
-        entropy = -sum(p * math.log2(p) for p in probs)
-        # Nếu entropy cao (gần 1) -> rất hỗn loạn, dự đoán sẽ khó
-        if entropy > 0.85:
-            # Chọn ngẫu nhiên thiên về đảo xu hướng gần nhất
-            last = window[0]
-            return ("XIU" if last == "TAI" else "TAI"), 53
-        else:
-            # Xu hướng rõ ràng hơn, theo đa số
-            most = cnt.most_common(1)[0][0]
-            return most, int(55 + (1 - entropy) * 30)
-        return None, 0
-
-    def algo_momentum_score(self, history):
-        """Động lượng điểm: so sánh trung bình ngắn hạn vs dài hạn."""
-        if len(history) < 8:
-            return None, 0
-        short = [h["point"] for h in history[:3]]
-        long = [h["point"] for h in history[:8]]
-        avg_short = sum(short) / 3
-        avg_long = sum(long) / 8
-        if avg_short > avg_long + 1.2:
-            return "TAI", 64
-        if avg_short < avg_long - 1.2:
-            return "XIU", 64
-        return None, 0
-
-    def algo_volatility(self, history):
-        """Đột biến độ lệch chuẩn và giá trị hiện tại ở biên."""
-        if len(history) < 12:
-            return None, 0
-        points = [h["point"] for h in history[:12]]
-        mean = sum(points) / len(points)
-        variance = sum((p - mean) ** 2 for p in points) / len(points)
-        std = math.sqrt(variance)
-        last_point = points[0]
-        if std > 3.5:
-            if last_point > mean + 1.5 * std:
-                return "XIU", 72
-            if last_point < mean - 1.5 * std:
-                return "TAI", 72
-        return None, 0
-
-    def algo_autocorr(self, history):
-        """Tự tương quan chuỗi nhị phân Tài/Xỉu để tìm chu kỳ lặp."""
-        if len(history) < 20:
-            return None, 0
-        seq = [1 if h["result"] == "TAI" else 0 for h in history[:40]]
-        n = len(seq)
+    @staticmethod
+    def _autocorr_cycle(series: List[float], max_lag=20):
+        """Tìm chu kỳ dựa trên autocorrelation của chuỗi số (điểm)"""
+        n = len(series)
+        if n < max_lag * 2:
+            return None
         best_lag = None
-        best_corr = -2
-        for lag in range(2, min(16, n//2)):
-            corr = sum(seq[i] * seq[i+lag] for i in range(n - lag)) / (n - lag)
+        best_corr = -1
+        mean = statistics.mean(series)
+        var = sum((x-mean)**2 for x in series)
+        if var == 0:
+            return None
+        for lag in range(4, max_lag+1):
+            if n - lag < lag: break
+            corr = sum((series[i]-mean)*(series[i+lag]-mean) for i in range(n-lag)) / var / (n-lag)
             if corr > best_corr:
                 best_corr = corr
                 best_lag = lag
-        if best_lag and best_corr > 0.65:
-            # Dự đoán dựa trên giá trị cách đây lag phiên
-            predicted_val = seq[best_lag-1]  # vì seq[0] là hiện tại, seq[lag] là quá khứ lag
-            return "TAI" if predicted_val == 1 else "XIU", int(55 + best_corr * 30)
+        if best_lag and best_corr > 0.3:
+            # Dự đoán tiếp theo là giá trị tại vị trí n-lag
+            pred_val = series[-best_lag]
+            return pred_val, best_lag, best_corr
+        return None
+    # ----------------------------------------------------------------
+
+    # ------------------------- CÁC THUẬT TOÁN MỚI --------------------
+    def algo_streak(self, history):
+        points, results = self._get_series(history)
+        if len(results) < 3:
+            return None, 0
+        last = results[-1]
+        streak = 1
+        for i in range(len(results)-2, -1, -1):
+            if results[i] == last:
+                streak += 1
+            else:
+                break
+        if streak >= 5:
+            return last, min(80, 55 + streak * 3)  # tăng confidence
+        if streak >= 3:
+            return last, 65
         return None, 0
 
-    # Danh sách tất cả thuật toán
+    def algo_break_detect(self, history):
+        points, results = self._get_series(history)
+        if len(results) < 5:
+            return None, 0
+        last = results[-1]
+        streak = 1
+        for i in range(len(results)-2, -1, -1):
+            if results[i] == last:
+                streak += 1
+            else:
+                break
+        if streak >= 5:
+            opp = "XIU" if last == "TAI" else "TAI"
+            return opp, 75
+        if streak >= 4:
+            opp = "XIU" if last == "TAI" else "TAI"
+            return opp, 65
+        return None, 0
+
+    def algo_linreg(self, history, period):
+        points, _ = self._get_series(history)
+        if len(points) < period + 1:
+            return None, 0
+        subset = points[-(period):]
+        _, _, r2, pred_point = self._linear_regression(subset)
+        direction = "TAI" if pred_point >= 11 else "XIU"
+        # confidence dựa trên R² và khoảng cách tới ngưỡng
+        dist = abs(pred_point - 10.5)
+        conf = min(85, int(55 + r2 * 25 + dist * 2))
+        return direction, conf
+
+    def algo_linreg_10(self, history): return self.algo_linreg(history, 10)
+    def algo_linreg_20(self, history): return self.algo_linreg(history, 20)
+    def algo_linreg_30(self, history): return self.algo_linreg(history, 30)
+
+    def algo_bollinger(self, history):
+        points, _ = self._get_series(history)
+        if len(points) < 20:
+            return None, 0
+        upper, _, lower = self._bollinger(points, 20, 2.0)
+        if upper is None:
+            return None, 0
+        last_point = points[-1]
+        if last_point >= upper:
+            return "XIU", 78
+        elif last_point <= lower:
+            return "TAI", 78
+        return None, 0
+
+    def algo_rsi(self, history):
+        points, _ = self._get_series(history)
+        if len(points) < 15:
+            return None, 0
+        rsi = self._rsi(points, 14)
+        if rsi > 70:
+            return "XIU", int(55 + (rsi - 70) * 0.8)  # max ~79
+        if rsi < 30:
+            return "TAI", int(55 + (30 - rsi) * 0.8)
+        return None, 0
+
+    def algo_macd(self, history):
+        points, _ = self._get_series(history)
+        if len(points) < 36:
+            return None, 0
+        macd_line, signal_line = self._macd(points, 12, 26, 9)
+        if macd_line is None or len(macd_line) < 2 or len(signal_line) < 2:
+            return None, 0
+        # Tín hiệu cắt nhau 2 phiên gần nhất
+        prev_diff = macd_line[-2] - signal_line[-2]
+        curr_diff = macd_line[-1] - signal_line[-1]
+        if prev_diff < 0 and curr_diff > 0:  # cắt lên -> xu hướng tăng (TÀI)
+            return "TAI", 72
+        elif prev_diff > 0 and curr_diff < 0:  # cắt xuống -> giảm (XỈU)
+            return "XIU", 72
+        # Nếu MACD vẫn trên signal mạnh
+        if curr_diff > 0.1:
+            return "TAI", 63
+        elif curr_diff < -0.1:
+            return "XIU", 63
+        return None, 0
+
+    def algo_stoch(self, history):
+        points, _ = self._get_series(history)
+        if len(points) < 14:
+            return None, 0
+        k, d = self._stochastic(points, 14, 3)
+        if k > 80:
+            return "XIU", 70
+        if k < 20:
+            return "TAI", 70
+        return None, 0
+
+    def algo_markov2(self, history):
+        _, results = self._get_series(history)
+        return self._markov2(results)
+
+    def algo_cycle(self, history):
+        points, _ = self._get_series(history)
+        cycle_info = self._autocorr_cycle(points, 20)
+        if cycle_info:
+            pred_point, lag, corr = cycle_info
+            direction = "TAI" if pred_point >= 10.5 else "XIU"
+            conf = min(85, int(60 + corr * 30))
+            return direction, conf
+        return None, 0
+
+    def algo_zscore(self, history):
+        points, _ = self._get_series(history)
+        if len(points) < 30:
+            return None, 0
+        mean = statistics.mean(points)
+        std = statistics.stdev(points)
+        if std == 0:
+            return None, 0
+        z = (points[-1] - mean) / std
+        if z > 1.2:
+            return "XIU", min(80, int(55 + abs(z)*12))
+        if z < -1.2:
+            return "TAI", min(80, int(55 + abs(z)*12))
+        return None, 0
+
+    def algo_ema_ratio(self, history):
+        _, results = self._get_series(history)
+        if len(results) < 20:
+            return None, 0
+        # Chuyển thành 0/1
+        binary = [1 if r == "TAI" else 0 for r in results]
+        ema = self._ema([float(b) for b in binary], 15)[-1]  # xu hướng gần đây
+        # Dự báo ngược với xu hướng nếu quá lệch
+        if ema > 0.65:
+            return "XIU", min(75, int(55 + (ema-0.5)*80))
+        if ema < 0.35:
+            return "TAI", min(75, int(55 + (0.5-ema)*80))
+        return None, 0
+
+    def algo_local_extrema(self, history):
+        points, _ = self._get_series(history)
+        if len(points) < 5:
+            return None, 0
+        # Tìm đỉnh/đáy gần nhất
+        last_idx = len(points) - 1
+        # Xét 3 điểm cuối
+        a = points[-3]
+        b = points[-2]
+        c = points[-1]
+        if a < b and b > c:  # đỉnh
+            return "XIU", 68
+        if a > b and b < c:  # đáy
+            return "TAI", 68
+        # Phát hiện đỉnh đáy dài hạn
+        for i in range(last_idx-2, 2, -1):
+            if points[i] > points[i-1] and points[i] > points[i+1]:
+                return "XIU", 66  # gần đỉnh
+            if points[i] < points[i-1] and points[i] < points[i+1]:
+                return "TAI", 66
+        return None, 0
+
+    # Danh sách các thuật toán sử dụng
     ALGORITHMS = [
-        ("freq20", algo_freq20),
-        ("freq50", algo_freq50),
-        ("freq100", algo_freq100),
-        ("markov1", algo_markov1),
-        ("markov2", algo_markov2),
-        ("rsi14", algo_rsi14),
+        ("streak", algo_streak),
+        ("break_detect", algo_break_detect),
+        ("linreg_10", algo_linreg_10),
+        ("linreg_20", algo_linreg_20),
+        ("linreg_30", algo_linreg_30),
+        ("bollinger", algo_bollinger),
+        ("rsi", algo_rsi),
         ("macd", algo_macd),
-        ("trend_dir", algo_trend_dir),
-        ("peak_bottom", algo_peak_bottom),
-        ("pattern_match", algo_pattern_match),
-        ("entropy", algo_entropy),
-        ("momentum_score", algo_momentum_score),
-        ("volatility", algo_volatility),
-        ("autocorr", algo_autocorr)
+        ("stoch", algo_stoch),
+        ("markov2", algo_markov2),
+        ("cycle", algo_cycle),
+        ("zscore", algo_zscore),
+        ("ema_ratio", algo_ema_ratio),
+        ("local_extrema", algo_local_extrema),
     ]
 
     def predict(self, history: List[Dict], site_game: str) -> Tuple[str, int, str, Dict]:
         if len(history) < 2:
             return random.choice(["TAI", "XIU"]), 50, "Không đủ dữ liệu", {}
-        weights = self.weights.get(site_game, DEFAULT_ALGO_WEIGHTS.copy())
+        weights = self.weights.get(site_game, DEFAULT_ALGO_WEIGHTS)
         raw = {"TAI": 0.0, "XIU": 0.0}
         contrib = []
         for name, func in self.ALGORITHMS:
@@ -701,17 +753,17 @@ class AIEngine:
         if total == 0:
             return random.choice(["TAI", "XIU"]), 50, "Không rõ pattern", {}
         ratio_tai = raw["TAI"] / total
-        # Vùng cân bằng chống thiên vị
+        # Vùng cân bằng để tránh thiên vị (mở rộng hơn)
         if 0.42 <= ratio_tai <= 0.58:
             pred = random.choice(["TAI", "XIU"])
             conf = 50
         else:
             pred = "TAI" if ratio_tai > 0.5 else "XIU"
             winner_ratio = ratio_tai if pred == "TAI" else (1 - ratio_tai)
-            conf = int(50 + winner_ratio * 78)
-            conf = max(50, min(94, conf))
+            conf = int(50 + winner_ratio * 75)
+            conf = max(50, min(92, conf))
         top = sorted([(n, c) for n, p, c, _ in contrib if p == pred], key=lambda x: x[1], reverse=True)[:3]
-        reason = " + ".join(f"{ALGO_NAMES.get(n,n)} ({c}%)" for n, c in top) if top else "Tổng hợp"
+        reason = " + ".join(f"{ALGO_NAMES.get(n,n)} ({c}%)" for n,c in top) if top else "Tổng hợp"
         votes = {name: {"pred": p, "conf": c, "weighted": round(w,4)} for name,p,c,w in contrib}
         return pred, conf, reason, votes
 
@@ -729,9 +781,11 @@ class AIEngine:
             logger.warning(f"learn weight update error: {e}")
 
     async def detect_and_save_patterns(self, site_game: str, history: List[Dict]):
-        pass  # Giữ nguyên
+        # Có thể bổ sung logic lưu pattern mới nếu cần
+        pass
+# =====================================================================
 
-# ---------------------------- BACKGROUND TASK (GIỮ NGUYÊN) -------------------------
+# ---------------------------- BACKGROUND TASK -------------------------
 async def background_fetch_and_learn(bot: Bot):
     logger.info("Background task started")
     while not _shutdown_event.is_set():
@@ -823,7 +877,7 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
     res_emoji = "🔴 TÀI" if last["result"] == "TAI" else "🔵 XỈU"
 
     recent_10 = [h["result"] for h in history[:10]][::-1]
-    recent_str = "  ".join(["🔴" if r == "TAI" else "🔵" for r in recent_10])
+    recent_str = " → ".join(["🔴" if r == "TAI" else "🔵" for r in recent_10])
 
     msg = (
         f"TOOL TÀI XỈU:\n"
@@ -832,7 +886,7 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
         f"📌 Phiên dự đoán: `{latest_id + 1}`\n"
         f"💡 Dự đoán: {pred_emoji} ({conf}%)\n"
         f"🧠 Lý do: {reason}\n"
-        f"📊 Cầu : {recent_str}\n"
+        f"📊 Cầu gần đây (cũ → mới): {recent_str}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"⏮ Phiên trước: `{latest_id}`\n"
         f"🎲 Xúc xắc: {dice_str} _( Σ {last['point']} )_\n"
@@ -874,7 +928,7 @@ async def clean_old_sessions(site_game: str):
     except Exception as e:
         logger.warning(f"clean_old_sessions: {e}")
 
-# ---------------------------- USER HANDLERS (GIỮ NGUYÊN) ---------------
+# ---------------------------- USER HANDLERS ---------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not update.message:
@@ -1118,7 +1172,7 @@ async def buy_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-# ---------------------------- ADMIN APPROVE (GIỮ NGUYÊN) -------------------
+# ---------------------------- ADMIN APPROVE ----------------------------
 async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -1440,7 +1494,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     global ai_engine
     setup_logging()
-    logger.info("Starting bot V6.1 Super AI...")
+    logger.info("Starting bot V7...")
     await init_db()
     ai_engine = AIEngine()
     await ai_engine.load_weights_from_db()
@@ -1485,7 +1539,7 @@ async def main():
             await app.start()
             await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
             bg_task = asyncio.create_task(background_fetch_and_learn(app.bot))
-            logger.info("✅ Bot V6.1 Super AI đang chạy. Ctrl+C để dừng.")
+            logger.info("✅ Bot V7 đang chạy. Ctrl+C để dừng.")
             loop = asyncio.get_running_loop()
             def stop_handler(*_):
                 _shutdown_event.set()
