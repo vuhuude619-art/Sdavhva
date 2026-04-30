@@ -1,554 +1,1402 @@
+#!/usr/bin/env python3
+"""
+Bot dự đoán Tài Xỉu siêu AI - Nâng cấp toàn diện
+- Thuật toán thông minh, tự học, đa sàn LC79 & BetVip
+- Quản lý key, thanh toán, broadcast, ban/unban, CSKH
+- Bảo trì, antispam, log học tập, thống kê thu nhập
+- Xử lý lỗi triệt để, chạy ổn định 24/7
+"""
+
 import asyncio
 import aiohttp
+import aiosqlite
+import json
+import logging
+import os
 import random
-from collections import deque
+import signal
+import sys
+import time
+import traceback
+from collections import defaultdict
 from datetime import datetime
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from typing import Optional, Dict, List, Any, Tuple
 
-BOT_TOKEN = "8778249747:AAFAjVSGVB-OWcOZdFYWCQA0ge2xwMEdNWs"
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    BotCommand,
+    Bot,
+)
+from telegram.constants import ParseMode, ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+from telegram.error import TelegramError, Forbidden, NetworkError, RetryAfter
 
-API_URLS = {
-    "md5": "https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412",
-    "hu":  "https://wtx.tele68.com/v1/tx/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412",
+# ---------------------------- CONFIG ---------------------------------
+BOT_TOKEN = "8715945694:AAFiwt_MVzBpqePFBs5Zi_2gC873GsIRv_Y"
+NOTIFY_TOKEN = "8651470861:AAHksB60vUwSNo1N1jv1p2SclhGFblckqXY"  # dùng cho thông báo CSKH
+ADMIN_IDS = [8001225219]
+CSKH_GROUP_ID = -1003739572185
+CSKH_USER_IDS = [6650824297, 8746174329]
+SUPPORT_USERNAME = "@CskhTool1199"
+
+DATABASE_PATH = "bot_data.db"
+LOG_FILE = "bot_errors.log"
+
+# ---------------------------- SÀN & GAME -----------------------------
+SITES = {
+    "lc79": {
+        "name": "🌟 LC79",
+        "games": {
+            "md5": {
+                "label": "🎮 MD5",
+                "url": "https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412",
+            },
+            "hu": {
+                "label": "🏆 Hũ",
+                "url": "https://wtx.tele68.com/v1/tx/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412",
+            },
+        },
+    },
+    "betvip": {
+        "name": "💎 BetVip",
+        "games": {
+            "tx": {
+                "label": "🎲 TX Thường",
+                "url": "https://wtx.macminim6.online/v1/tx/lite-sessions?cp=R&cl=R&pf=web&at=93f594258a0738a76144f41ea9ab7a3f",
+            },
+            "md5": {
+                "label": "🎮 MD5",
+                "url": "https://wtxmd52.macminim6.online/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=93f594258a0738a76144f41ea9ab7a3f",
+            },
+        },
+    },
 }
 
-REQ_HEADERS = {
-    "accept": "*/*",
-    "accept-language": "vi-VN,vi;q=0.9",
-    "Referer": "https://lc79b.bet/",
-}
+GAME_MAP = {}
+for site_id, site in SITES.items():
+    for game_id, game in site["games"].items():
+        GAME_MAP[f"{site_id}_{game_id}"] = {
+            "site": site_id,
+            "game": game_id,
+            "label": f"{site['name']} {game['label']}",
+            "url": game["url"],
+        }
 
-GAME_LABEL = {"md5": "🎮 *LC MD5*", "hu": "🏆 *LC Hũ*"}
 DICE_EMO = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣"}
+PRICE_PLANS = {"1": 15000, "7": 70000, "30": 360000}
 
-ALGO_NAME_VN = {
-    "streak":       "Cầu bệt",
-    "break_detect": "Phát hiện gãy cầu",
-    "pingpong":     "Cầu 1-1 ping pong",
-    "pairs":        "Cầu 2-2 / 3-3",
-    "zigzag":       "Cầu zigzag",
-    "freq20":       "Tần suất 20 phiên",
-    "freq50":       "Tần suất 50 phiên",
-    "point_trend":  "Xu hướng điểm số",
-    "pattern6":     "Pattern 6 phiên lịch sử",
-    "trend":        "Xu hướng tổng thể",
-    "dice_avg":     "Trung bình xúc xắc",
-    "momentum":     "Đà tăng / giảm điểm",
+# ---------------------------- AI CONFIG ------------------------------
+DEFAULT_ALGO_WEIGHTS = {
+    "streak": 1.0, "break_detect": 1.2, "pingpong": 1.1,
+    "pairs": 1.0, "zigzag": 0.9, "freq20": 1.0,
+    "freq50": 1.1, "freq100": 0.9, "point_trend": 0.8,
+    "peak": 1.3, "pattern6": 1.5, "pattern7": 1.6,
+    "pattern8": 1.5, "entropy": 1.0, "momentum": 1.1,
+    "cau_lap": 1.4, "cham_dinh": 1.4, "point_analysis": 1.2,
+    "complex_pattern": 1.5, "reverse_momentum": 1.0,
 }
 
-
-def default_weights():
-    return {
-        "streak":       1.5,
-        "break_detect": 1.8,
-        "pingpong":     1.2,
-        "pairs":        1.1,
-        "zigzag":       0.8,
-        "freq20":       1.0,
-        "freq50":       0.9,
-        "point_trend":  0.7,
-        "pattern6":     1.3,
-        "trend":        0.9,
-        "dice_avg":     0.6,
-        "momentum":     1.0,
-    }
-
-
-def make_game():
-    return {
-        "running":  False,
-        "task":     None,
-        "history":  deque(maxlen=100),
-        "preds":    deque(maxlen=500),
-        "last_id":  None,
-        "chat_id":  None,
-        "weights":  default_weights(),
-        "correct":  0,
-        "wrong":    0,
-        "pending":  None,
-    }
-
-
-STATE = {"md5": make_game(), "hu": make_game()}
-
-
-def _streak_info(h):
-    if not h:
-        return None, 0
-    last = h[0]["result"]
-    streak = 1
-    for i in range(1, len(h)):
-        if h[i]["result"] == last:
-            streak += 1
-        else:
-            break
-    return last, streak
-
-
-def algo_streak(h):
-    last, s = _streak_info(h)
-    if s < 2:
-        return None, 0
-    if s <= 3:
-        return last, 52
-    return last, 56
-
-
-def algo_break_detect(h):
-    last, s = _streak_info(h)
-    if s >= 5:
-        opp = "TAI" if last == "XIU" else "XIU"
-        return opp, min(82, 60 + (s - 5) * 5)
-    return None, 0
-
-
-def algo_pingpong(h):
-    if len(h) < 4:
-        return None, 0
-    r = [h[i]["result"] for i in range(min(6, len(h)))]
-    if all(r[i] != r[i + 1] for i in range(min(5, len(r) - 1))):
-        return ("TAI" if r[0] == "XIU" else "XIU"), 68
-    if len(r) >= 4 and all(r[i] != r[i + 1] for i in range(3)):
-        return ("TAI" if r[0] == "XIU" else "XIU"), 60
-    return None, 0
-
-
-def algo_pairs(h):
-    if len(h) < 6:
-        return None, 0
-    r = [h[i]["result"] for i in range(min(8, len(h)))]
-    if len(r) >= 4 and r[0] == r[1] and r[2] == r[3] and r[0] != r[2]:
-        return r[0], 62
-    if len(r) >= 6 and r[0] == r[1] == r[2] and r[3] == r[4] == r[5] and r[0] != r[3]:
-        return r[0], 66
-    return None, 0
-
-
-def algo_zigzag(h):
-    if len(h) < 6:
-        return None, 0
-    r = [h[i]["result"] for i in range(6)]
-    changes = [r[i] != r[i + 1] for i in range(5)]
-    score = sum(1 for i in range(4) if changes[i] != changes[i + 1])
-    if score >= 3:
-        pred = r[0] if not changes[0] else ("TAI" if r[0] == "XIU" else "XIU")
-        return pred, 57
-    return None, 0
-
-
-def algo_freq20(h):
-    n = min(20, len(h))
-    if n < 5:
-        return None, 0
-    tai = sum(1 for i in range(n) if h[i]["result"] == "TAI")
-    r = tai / n
-    if r > 0.68:
-        return "XIU", int(r * 65)
-    if r < 0.32:
-        return "TAI", int((1 - r) * 65)
-    return None, 0
-
-
-def algo_freq50(h):
-    n = min(50, len(h))
-    if n < 15:
-        return None, 0
-    tai = sum(1 for i in range(n) if h[i]["result"] == "TAI")
-    r = tai / n
-    if r > 0.65:
-        return "XIU", int(r * 60)
-    if r < 0.35:
-        return "TAI", int((1 - r) * 60)
-    return None, 0
-
-
-def algo_point_trend(h):
-    if len(h) < 5:
-        return None, 0
-    avg = sum(h[i]["point"] for i in range(5)) / 5
-    if avg > 12.5:
-        return "TAI", 56
-    if avg < 8.5:
-        return "XIU", 56
-    return None, 0
-
-
-def algo_pattern6(h):
-    n = len(h)
-    if n < 14:
-        return None, 0
-    pattern = tuple(h[i]["result"] for i in range(6))
-    tai_c = xiu_c = 0
-    for i in range(6, n - 6):
-        win = tuple(h[j]["result"] for j in range(i, i + 6))
-        if win == pattern:
-            after = h[i - 1]["result"]
-            if after == "TAI":
-                tai_c += 1
-            else:
-                xiu_c += 1
-    total = tai_c + xiu_c
-    if total < 2:
-        return None, 0
-    if tai_c >= xiu_c:
-        return "TAI", min(73, int((tai_c / total) * 75))
-    return "XIU", min(73, int((xiu_c / total) * 75))
-
-
-def algo_trend(h):
-    if len(h) < 10:
-        return None, 0
-    r_tai = sum(1 for i in range(5) if h[i]["result"] == "TAI")
-    o_tai = sum(1 for i in range(5, 10) if h[i]["result"] == "TAI")
-    diff = r_tai - o_tai
-    if diff >= 3:
-        return "TAI", 60
-    if diff <= -3:
-        return "XIU", 60
-    return None, 0
-
-
-def algo_dice_avg(h):
-    if len(h) < 8:
-        return None, 0
-    all_dice = []
-    for i in range(min(15, len(h))):
-        all_dice.extend(h[i].get("dices", []))
-    if not all_dice:
-        return None, 0
-    avg = sum(all_dice) / len(all_dice)
-    if avg > 3.8:
-        return "TAI", 54
-    if avg < 3.2:
-        return "XIU", 54
-    return None, 0
-
-
-def algo_momentum(h):
-    if len(h) < 3:
-        return None, 0
-    p0, p1, p2 = h[0]["point"], h[1]["point"], h[2]["point"]
-    if p0 > p1 > p2:
-        return "TAI", 55
-    if p0 < p1 < p2:
-        return "XIU", 55
-    return None, 0
-
-
-ALGOS = {
-    "streak":       algo_streak,
-    "break_detect": algo_break_detect,
-    "pingpong":     algo_pingpong,
-    "pairs":        algo_pairs,
-    "zigzag":       algo_zigzag,
-    "freq20":       algo_freq20,
-    "freq50":       algo_freq50,
-    "point_trend":  algo_point_trend,
-    "pattern6":     algo_pattern6,
-    "trend":        algo_trend,
-    "dice_avg":     algo_dice_avg,
-    "momentum":     algo_momentum,
+ALGO_NAMES = {
+    "streak": "Cầu bệt", "break_detect": "Cầu bẻ", "pingpong": "Cầu 1-1",
+    "pairs": "Cầu 2-2", "zigzag": "Cầu đảo", "freq20": "Tần suất 20",
+    "freq50": "Tần suất 50", "freq100": "Tần suất 100", "point_trend": "Xu hướng điểm",
+    "peak": "Chạm đỉnh", "pattern6": "Mẫu 6", "pattern7": "Mẫu 7",
+    "pattern8": "Mẫu 8", "entropy": "Hỗn loạn", "momentum": "Quán tính",
+    "cau_lap": "Cầu lặp", "cham_dinh": "Chạm định", "point_analysis": "Phân tích điểm",
+    "complex_pattern": "Mẫu phức", "reverse_momentum": "Đảo quán tính",
 }
 
+RECENT_WINDOW = 50
+MAX_SESSION_HISTORY = 500
+WEIGHT_MIN = 0.3
+WEIGHT_MAX = 3.0
+WEIGHT_INC = 1.03
+WEIGHT_DEC = 0.97
 
-def predict(history, weights):
-    if len(history) < 2:
-        tai = sum(1 for i in range(len(history)) if history[i]["result"] == "TAI")
-        return ("TAI" if tai * 2 >= len(history) else "XIU"), 50
+# ---------------------------- GLOBALS ---------------------------------
+db = None
+ai_engine = None
+user_watches = defaultdict(list)
+_shutdown_event = asyncio.Event()
+logger = logging.getLogger("txbot")
 
-    votes = {"TAI": 0.0, "XIU": 0.0}
-    for name, fn in ALGOS.items():
-        w = weights.get(name, 1.0)
-        pred, conf = fn(history)
-        if pred and conf > 0:
-            votes[pred] += w * conf
+# ---------------------------- LOGGING ---------------------------------
+def setup_logging():
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    root.addHandler(fh)
+    root.addHandler(sh)
+    for noisy in ("httpx", "httpcore", "telegram.ext._updater",
+                  "telegram.ext.Application", "aiosqlite"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    total = votes["TAI"] + votes["XIU"]
-    if total == 0:
-        tai = sum(1 for i in range(min(10, len(history))) if history[i]["result"] == "TAI")
-        return ("TAI" if tai >= 5 else "XIU"), 50
+# ---------------------------- DATABASE ---------------------------------
+async def init_db():
+    global db
+    db = await aiosqlite.connect(DATABASE_PATH)
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA synchronous=NORMAL")
+    await db.execute("PRAGMA foreign_keys=ON")
 
-    tai_r = votes["TAI"] / total
-    if tai_r >= 0.5:
-        return "TAI", min(95, int(tai_r * 100))
-    return "XIU", min(95, int((1 - tai_r) * 100))
+    tables = [
+        """CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_game TEXT NOT NULL, session_id INTEGER NOT NULL,
+            result TEXT NOT NULL, dices TEXT, point INTEGER,
+            timestamp REAL NOT NULL,
+            UNIQUE(site_game, session_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_game TEXT NOT NULL, session_id INTEGER,
+            predicted TEXT, confidence INTEGER,
+            actual TEXT, correct INTEGER,
+            reason TEXT, timestamp REAL NOT NULL,
+            user_id INTEGER, algo_votes TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, username TEXT,
+            full_name TEXT, banned INTEGER DEFAULT 0,
+            joined_date REAL NOT NULL, last_active REAL NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS keys (
+            key TEXT PRIMARY KEY, days INTEGER,
+            created REAL, created_by INTEGER
+        )""",
+        """CREATE TABLE IF NOT EXISTS user_keys (
+            user_id INTEGER PRIMARY KEY, key TEXT,
+            activated REAL,
+            FOREIGN KEY(key) REFERENCES keys(key)
+        )""",
+        """CREATE TABLE IF NOT EXISTS payments (
+            id TEXT PRIMARY KEY, user_id INTEGER,
+            amount INTEGER, days INTEGER, timestamp REAL,
+            status TEXT DEFAULT 'pending', handled_by INTEGER
+        )""",
+        """CREATE TABLE IF NOT EXISTS global_weights (
+            site_game TEXT PRIMARY KEY, weights TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS chat_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER, cskh_id INTEGER,
+            status TEXT DEFAULT 'pending',
+            created REAL, closed REAL
+        )""",
+        """CREATE TABLE IF NOT EXISTS bot_config (
+            key TEXT PRIMARY KEY, value TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS antispam (
+            user_id INTEGER PRIMARY KEY,
+            last_command_time REAL,
+            count INTEGER DEFAULT 1
+        )""",
+        "INSERT OR IGNORE INTO bot_config (key, value) VALUES ('maintenance', '0')",
+        "CREATE INDEX IF NOT EXISTS idx_sess_sg ON sessions(site_game, session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pred_sg ON predictions(site_game, session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pred_uid ON predictions(user_id)",
+    ]
+    for stmt in tables:
+        await db.execute(stmt)
+    await db.commit()
+    logger.info("Database initialized")
 
+async def close_db():
+    global db
+    if db:
+        try:
+            await db.close()
+            logger.info("Database closed")
+        except Exception as e:
+            logger.error(f"close_db error: {e}")
+        db = None
 
-async def fetch_api(game_type):
+# ---------------------------- UTILS -----------------------------------
+async def check_antispam(user_id: int) -> bool:
     try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(
-                API_URLS[game_type],
-                headers=REQ_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
+        now = time.time()
+        async with db.execute("SELECT last_command_time, count FROM antispam WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        if row:
+            last_t, cnt = row
+            if now - last_t < 1.5:
+                cnt += 1
+                if cnt >= 6:
+                    return False
+                await db.execute("UPDATE antispam SET count=? WHERE user_id=?", (cnt, user_id))
+            else:
+                await db.execute("UPDATE antispam SET last_command_time=?, count=1 WHERE user_id=?", (now, user_id))
+        else:
+            await db.execute("INSERT INTO antispam (user_id, last_command_time, count) VALUES (?,?,1)", (user_id, now))
+        await db.commit()
+        return True
+    except Exception as e:
+        logger.warning(f"antispam error {user_id}: {e}")
+        return True
+
+async def is_user_valid(user_id: int) -> bool:
+    try:
+        async with db.execute("SELECT banned FROM users WHERE user_id=?", (user_id,)) as cur:
+            banned = await cur.fetchone()
+            if banned and banned[0] == 1:
+                return False
+        async with db.execute(
+            "SELECT k.days, k.created FROM user_keys uk JOIN keys k ON uk.key=k.key WHERE uk.user_id=?", (user_id,)
+        ) as cur:
+            key_info = await cur.fetchone()
+        if not key_info:
+            return False
+        days, created = key_info
+        return time.time() < created + days * 86400
+    except Exception as e:
+        logger.warning(f"is_user_valid error {user_id}: {e}")
+        return False
+
+async def is_maintenance() -> bool:
+    try:
+        async with db.execute("SELECT value FROM bot_config WHERE key='maintenance'") as cur:
+            row = await cur.fetchone()
+        return row and row[0] == "1"
+    except:
+        return False
+
+def parse_session_entry(s: Dict) -> Dict:
+    return {
+        "id": s["id"],
+        "result": s.get("resultTruyenThong", "TAI"),
+        "dices": s.get("dices", []),
+        "point": s.get("point", 0),
+    }
+
+async def fetch_api(url: str) -> List[Dict]:
+    try:
+        timeout = aiohttp.ClientTimeout(total=12)
+        headers = {
+            "accept": "*/*",
+            "accept-language": "vi-VN,vi;q=0.9",
+            "Referer": "https://lc79b.bet/",
+            "User-Agent": "Mozilla/5.0",
+        }
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
-                    return data.get("list", [])
-    except Exception:
-        pass
+                    lst = data.get("list", [])
+                    if isinstance(lst, list):
+                        return lst
+                else:
+                    logger.warning(f"fetch_api HTTP {resp.status}: {url}")
+    except Exception as e:
+        logger.warning(f"fetch_api error {url}: {e}")
     return []
 
-
-def build_msg(game_type, next_id, pred, conf, latest, match=None):
-    st = STATE[game_type]
-    now = datetime.now().strftime("%H:%M:%S")
-
-    p_emo = "🔴" if pred == "TAI" else "🔵"
-    p_txt = "TÀI" if pred == "TAI" else "XỈU"
-    r_emo = "🔴" if latest["result"] == "TAI" else "🔵"
-    r_txt = "TÀI" if latest["result"] == "TAI" else "XỈU"
-
-    dice_str = " ".join(DICE_EMO.get(d, str(d)) for d in latest.get("dices", []))
-    stars = "⭐" * max(1, conf // 20)
-
-    total = st["correct"] + st["wrong"]
-    acc_line = ""
-    if total > 0:
-        acc = int(st["correct"] / total * 100)
-        acc_line = f"📈 *Tỉ lệ:* `{st['correct']}/{total}` _({acc}%)_\n"
-
-    match_line = ""
-    if match == "correct":
-        match_line = "\n✅ *Khớp dự đoán!* 🎉"
-    elif match == "wrong":
-        match_line = "\n❌ *Lệch dự đoán!* 📉"
-
-    return (
-        f"{GAME_LABEL[game_type]}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 *Phiên dự đoán:* `{next_id}`\n"
-        f"💡 *Dự đoán:* {p_emo} *{p_txt}*\n"
-        f"📊 *Tin cậy:* `{conf}%` {stars}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"⏮ *Phiên trước:* `{latest['id']}`\n"
-        f"🎲 *Xúc xắc:* {dice_str} _( Σ {latest['point']} )_\n"
-        f"🏆 *Kết quả:* {r_emo} *{r_txt}*"
-        f"{match_line}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"{acc_line}"
-        f"⏰ *Time:* `{now}`"
-    )
-
-
-def parse_entry(s):
-    return {
-        "id":     s["id"],
-        "result": s["resultTruyenThong"],
-        "dices":  s.get("dices", []),
-        "point":  s.get("point", 0),
-    }
-
-
-async def prediction_loop(bot, game_type):
-    st = STATE[game_type]
+async def safe_send(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
     try:
-        sessions = await fetch_api(game_type)
-        if sessions:
-            for s in reversed(sessions):
-                st["history"].appendleft(parse_entry(s))
+        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        return True
+    except Forbidden:
+        logger.info(f"safe_send: user {chat_id} blocked bot")
+    except RetryAfter as e:
+        logger.warning(f"safe_send rate limited, retry after {e.retry_after}s")
+        await asyncio.sleep(e.retry_after + 1)
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            return True
+        except:
+            pass
+    except Exception as e:
+        logger.warning(f"safe_send error {chat_id}: {e}")
+    return False
 
-            latest = sessions[0]
-            st["last_id"] = latest["id"]
-            pred, conf = predict(st["history"], st["weights"])
-            st["pending"] = {"id": latest["id"] + 1, "pred": pred}
+def _safe_json(val, default):
+    if val is None:
+        return default
+    if isinstance(val, (dict, list)):
+        return val
+    try:
+        return json.loads(val)
+    except:
+        return default
 
-            msg = build_msg(game_type, latest["id"] + 1, pred, conf, st["history"][0])
-            await bot.send_message(chat_id=st["chat_id"], text=msg, parse_mode=ParseMode.MARKDOWN)
+# ---------------------------- AI ENGINE ---------------------------------
+class AIEngine:
+    def __init__(self):
+        self.weights = defaultdict(lambda: DEFAULT_ALGO_WEIGHTS.copy())
 
-        while st["running"]:
-            await asyncio.sleep(5)
+    async def load_weights_from_db(self):
+        try:
+            async with db.execute("SELECT site_game, weights FROM global_weights") as cur:
+                async for row in cur:
+                    try:
+                        loaded = json.loads(row[1])
+                        merged = DEFAULT_ALGO_WEIGHTS.copy()
+                        merged.update({k: float(v) for k, v in loaded.items() if k in merged})
+                        self.weights[row[0]] = merged
+                    except:
+                        pass
+        except Exception as e:
+            logger.error(f"load_weights error: {e}")
 
-            sessions = await fetch_api(game_type)
-            if not sessions:
+    async def save_weights_to_db(self, site_game: str):
+        try:
+            await db.execute(
+                "INSERT OR REPLACE INTO global_weights (site_game, weights) VALUES (?,?)",
+                (site_game, json.dumps(self.weights[site_game]))
+            )
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"save_weights error {site_game}: {e}")
+
+    # ------------------------- ALGORITHMS -----------------------------
+    @staticmethod
+    def _streak_info(history):
+        if not history:
+            return None, 0
+        last = history[0]["result"]
+        streak = 1
+        for i in range(1, len(history)):
+            if history[i]["result"] == last:
+                streak += 1
+            else:
+                break
+        return last, streak
+
+    def algo_streak(self, history):
+        last, s = self._streak_info(history)
+        if s < 3:
+            return None, 0
+        return last, min(68, 44 + s * 3)
+
+    def algo_break_detect(self, history):
+        last, s = self._streak_info(history)
+        if s >= 5:
+            opp = "XIU" if last == "TAI" else "TAI"
+            return opp, min(82, 54 + (s - 5) * 5)
+        return None, 0
+
+    def algo_pingpong(self, history):
+        if len(history) < 4:
+            return None, 0
+        r = [h["result"] for h in history[:min(8, len(history))]]
+        if len(r) >= 6 and all(r[i] != r[i+1] for i in range(5)):
+            return ("XIU" if r[0] == "TAI" else "TAI"), 76
+        if len(r) >= 4 and all(r[i] != r[i+1] for i in range(3)):
+            return ("XIU" if r[0] == "TAI" else "TAI"), 66
+        return None, 0
+
+    def algo_pairs(self, history):
+        if len(history) < 4:
+            return None, 0
+        r = [h["result"] for h in history[:min(12, len(history))]]
+        if len(r) >= 6 and r[0]==r[1]==r[2] and r[3]==r[4]==r[5] and r[0]!=r[3]:
+            return r[0], 76
+        if len(r) >= 4 and r[0]==r[1] and r[2]==r[3] and r[0]!=r[2]:
+            return r[0], 70
+        return None, 0
+
+    def algo_zigzag(self, history):
+        if len(history) < 6:
+            return None, 0
+        r = [h["result"] for h in history[:6]]
+        changes = [r[i] != r[i+1] for i in range(5)]
+        score = sum(1 for i in range(4) if changes[i] != changes[i+1])
+        if score >= 3:
+            pred = r[0] if not changes[0] else ("XIU" if r[0]=="TAI" else "TAI")
+            return pred, 63
+        return None, 0
+
+    def _freq(self, history, n, thresh, base):
+        if len(history) < max(4, n // 3):
+            return None, 0
+        subset = history[:n]
+        tai = sum(1 for h in subset if h["result"] == "TAI")
+        ratio = tai / len(subset)
+        if ratio > thresh:
+            return "XIU", int(min(ratio, 0.95) * base)
+        if ratio < (1 - thresh):
+            return "TAI", int(min(1-ratio, 0.95) * base)
+        return None, 0
+
+    def algo_freq20(self, history): return self._freq(history, 20, 0.65, 66)
+    def algo_freq50(self, history): return self._freq(history, 50, 0.62, 63)
+    def algo_freq100(self, history): return self._freq(history, 100, 0.60, 61)
+
+    def algo_point_trend(self, history):
+        if len(history) < 5:
+            return None, 0
+        avg = sum(h["point"] for h in history[:5]) / 5
+        if avg > 12.0:
+            return "TAI", 62
+        if avg < 9.0:
+            return "XIU", 62
+        return None, 0
+
+    def algo_peak(self, history):
+        if len(history) < 3:
+            return None, 0
+        pts = [h["point"] for h in history[:3]]
+        if all(p >= 11 for p in pts):
+            return "XIU", 70
+        if all(p <= 7 for p in pts):
+            return "TAI", 70
+        return None, 0
+
+    def _pattern_match(self, history, pat_len):
+        n = len(history)
+        if n < pat_len * 2 + 2:
+            return None, 0
+        pattern = tuple(h["result"] for h in history[:pat_len])
+        counts = {"TAI": 0, "XIU": 0}
+        for i in range(pat_len, n - pat_len):
+            window = tuple(history[j]["result"] for j in range(i, i+pat_len))
+            if window == pattern and i-1 >= 0:
+                after = history[i-1]["result"]
+                counts[after] = counts.get(after, 0) + 1
+        total = sum(counts.values())
+        if total < 2:
+            return None, 0
+        pred = "TAI" if counts["TAI"] >= counts["XIU"] else "XIU"
+        conf = int((counts[pred] / total) * 78)
+        return pred, min(78, conf)
+
+    def algo_pattern6(self, history): return self._pattern_match(history, 6)
+    def algo_pattern7(self, history): return self._pattern_match(history, 7)
+    def algo_pattern8(self, history): return self._pattern_match(history, 8)
+
+    def algo_entropy(self, history):
+        if len(history) < 6:
+            return None, 0
+        window = history[:min(12, len(history))]
+        changes = sum(1 for i in range(1, len(window)) if window[i]["result"] != window[i-1]["result"])
+        if changes >= 8:
+            return history[0]["result"], 56
+        if changes <= 3:
+            return history[0]["result"], 60
+        return None, 0
+
+    def algo_momentum(self, history):
+        if len(history) < 3:
+            return None, 0
+        p0, p1, p2 = history[0]["point"], history[1]["point"], history[2]["point"]
+        if p0 > p1 > p2:
+            return "TAI", 60
+        if p0 < p1 < p2:
+            return "XIU", 60
+        return None, 0
+
+    def algo_cau_lap(self, history):
+        if len(history) < 6:
+            return None, 0
+        r = [h["result"] for h in history[:min(30, len(history))]]
+        for cycle in range(2, 9):
+            if len(r) < cycle * 3:
                 continue
+            pattern = r[:cycle]
+            repeats = 1
+            idx = cycle
+            while idx + cycle <= len(r) and r[idx:idx+cycle] == pattern:
+                repeats += 1
+                idx += cycle
+            if repeats >= 2:
+                pos = (idx - cycle) % cycle if idx >= cycle else 0
+                return pattern[pos % len(pattern)], 68
+        return None, 0
 
-            latest_id = sessions[0]["id"]
-            if latest_id == st["last_id"]:
-                continue
+    def algo_cham_dinh(self, history):
+        if len(history) < 4:
+            return None, 0
+        pts = [h["point"] for h in history[:3]]
+        if all(9 <= p <= 12 for p in pts):
+            return "XIU", 64
+        if all(7 <= p <= 9 for p in pts):
+            return "TAI", 64
+        return None, 0
 
-            entry = parse_entry(sessions[0])
-            st["history"].appendleft(entry)
+    def algo_point_analysis(self, history):
+        if len(history) < 5:
+            return None, 0
+        pts = [h["point"] for h in history[:5]]
+        high = sum(1 for p in pts if p >= 11)
+        low = sum(1 for p in pts if p <= 7)
+        if high >= 4:
+            return "XIU", 76
+        if low >= 4:
+            return "TAI", 76
+        if pts[0] > pts[1] > pts[2]:
+            return "XIU", 63
+        if pts[0] < pts[1] < pts[2]:
+            return "TAI", 63
+        return None, 0
 
-            match = None
-            if st["pending"] and st["pending"]["id"] == latest_id:
-                correct = entry["result"] == st["pending"]["pred"]
-                if correct:
-                    st["correct"] += 1
-                    match = "correct"
-                else:
-                    st["wrong"] += 1
-                    match = "wrong"
-                st["preds"].appendleft({
-                    "id":      latest_id,
-                    "pred":    st["pending"]["pred"],
-                    "actual":  entry["result"],
-                    "correct": correct,
-                })
+    def algo_complex_pattern(self, history):
+        if len(history) < 10:
+            return None, 0
+        n = min(60, len(history))
+        seq = [h["result"] for h in history[:n]]
+        pat = tuple(seq[:4])
+        next_vals = []
+        for i in range(4, n - 4):
+            if tuple(seq[i:i+4]) == pat and i-1 >= 0:
+                next_vals.append(seq[i-1])
+        if len(next_vals) >= 2:
+            pred = max(set(next_vals), key=next_vals.count)
+            ratio = next_vals.count(pred) / len(next_vals)
+            return pred, int(min(78, ratio * 80))
+        return None, 0
 
-            st["last_id"] = latest_id
-            pred, conf = predict(st["history"], st["weights"])
-            st["pending"] = {"id": latest_id + 1, "pred": pred}
+    def algo_reverse_momentum(self, history):
+        if len(history) < 3:
+            return None, 0
+        p0, p2 = history[0]["point"], history[2]["point"]
+        diff = abs(p0 - p2)
+        if diff >= 7:
+            return ("TAI" if p0 < p2 else "XIU"), 66
+        return None, 0
 
-            msg = build_msg(game_type, latest_id + 1, pred, conf, entry, match)
-            await bot.send_message(chat_id=st["chat_id"], text=msg, parse_mode=ParseMode.MARKDOWN)
+    ALGORITHMS = [
+        ("streak", algo_streak), ("break_detect", algo_break_detect),
+        ("pingpong", algo_pingpong), ("pairs", algo_pairs), ("zigzag", algo_zigzag),
+        ("freq20", algo_freq20), ("freq50", algo_freq50), ("freq100", algo_freq100),
+        ("point_trend", algo_point_trend), ("peak", algo_peak),
+        ("pattern6", algo_pattern6), ("pattern7", algo_pattern7), ("pattern8", algo_pattern8),
+        ("entropy", algo_entropy), ("momentum", algo_momentum), ("cau_lap", algo_cau_lap),
+        ("cham_dinh", algo_cham_dinh), ("point_analysis", algo_point_analysis),
+        ("complex_pattern", algo_complex_pattern), ("reverse_momentum", algo_reverse_momentum),
+    ]
 
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        pass
-
-
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    if not args or args[0].lower() not in ("md5", "hu"):
-        await update.message.reply_text(
-            "⚠️ *Cú pháp:* `/start md5` hoặc `/start hu`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    game = args[0].lower()
-    st = STATE[game]
-
-    if st["running"]:
-        await update.message.reply_text(
-            f"⚡ {GAME_LABEL[game]} *đang chạy rồi!*",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    st["running"] = True
-    st["chat_id"] = update.effective_chat.id
-    st["last_id"] = None
-    st["pending"] = None
-    st["correct"] = 0
-    st["wrong"]   = 0
-    st["weights"] = default_weights()
-    st["history"].clear()
-    st["preds"].clear()
-
-    await update.message.reply_text(
-        f"🚀 {GAME_LABEL[game]}\n*Bắt đầu dự đoán tự động...*\n_Đang tải dữ liệu lịch sử..._",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    st["task"] = asyncio.create_task(prediction_loop(ctx.bot, game))
-
-
-async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    stopped = []
-    for game, st in STATE.items():
-        if st["running"] and st["chat_id"] == chat_id:
-            st["running"] = False
-            if st["task"]:
-                st["task"].cancel()
-                st["task"] = None
-            stopped.append(game)
-
-    if not stopped:
-        await update.message.reply_text(
-            "⚠️ *Không có bot nào đang chạy.*",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    lines = ["🛑 *Đã dừng dự đoán*\n"]
-    for game in stopped:
-        st = STATE[game]
-        total = st["correct"] + st["wrong"]
-        acc = int(st["correct"] / total * 100) if total > 0 else 0
-        lines.append(
-            f"{GAME_LABEL[game]}\n"
-            f"✅ *Đúng:* `{st['correct']}`  ❌ *Sai:* `{st['wrong']}`\n"
-            f"📊 *Tỉ lệ:* `{acc}%`"
-        )
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
-async def cmd_hoc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    results = []
-    for game, st in STATE.items():
-        preds = list(st["preds"])
-        if len(preds) < 5:
-            continue
-
-        recent = preds[: min(30, len(preds))]
-        acc = sum(1 for p in recent if p["correct"]) / len(recent)
-        w = st["weights"]
-
-        if acc < 0.45:
-            for k in w:
-                w[k] = max(0.3, min(3.0, w[k] + random.uniform(-0.15, 0.25)))
-        elif acc < 0.55:
-            for k in w:
-                w[k] = max(0.3, min(3.0, w[k] + random.uniform(-0.08, 0.15)))
+    def predict(self, history: List[Dict], site_game: str) -> Tuple[str, int, str, Dict]:
+        if len(history) < 2:
+            return random.choice(["TAI", "XIU"]), 50, "Không đủ dữ liệu", {}
+        weights = self.weights.get(site_game, DEFAULT_ALGO_WEIGHTS)
+        raw = {"TAI": 0.0, "XIU": 0.0}
+        contrib = []
+        for name, func in self.ALGORITHMS:
+            try:
+                pred, conf = func(self, history)
+            except Exception:
+                pred, conf = None, 0
+            if pred in ("TAI", "XIU") and conf > 0:
+                w = max(WEIGHT_MIN, min(WEIGHT_MAX, weights.get(name, 1.0)))
+                weighted = w * conf
+                raw[pred] += weighted
+                contrib.append((name, pred, conf, weighted))
+        total = raw["TAI"] + raw["XIU"]
+        if total == 0:
+            return random.choice(["TAI", "XIU"]), 50, "Không rõ pattern", {}
+        ratio_tai = raw["TAI"] / total
+        if 0.46 <= ratio_tai <= 0.54:
+            pred = random.choice(["TAI", "XIU"])
+            conf = 50
         else:
-            for k in w:
-                w[k] = max(0.3, min(3.0, w[k] * random.uniform(0.97, 1.07)))
+            pred = "TAI" if ratio_tai > 0.5 else "XIU"
+            winner_ratio = ratio_tai if pred == "TAI" else (1 - ratio_tai)
+            conf = int(50 + winner_ratio * 80)
+            conf = max(50, min(92, conf))
+        top = sorted([(n, c) for n, p, c, _ in contrib if p == pred], key=lambda x: x[1], reverse=True)[:2]
+        reason = " + ".join(f"{ALGO_NAMES.get(n,n)} ({c}%)" for n,c in top) if top else "Tổng hợp"
+        votes = {name: {"pred": p, "conf": c, "weighted": round(w,4)} for name,p,c,w in contrib}
+        return pred, conf, reason, votes
 
-        top3 = sorted(w.items(), key=lambda x: x[1], reverse=True)[:3]
-        top_str = "\n".join(
-            f"  • _{ALGO_NAME_VN.get(k, k)}_ → `{v:.2f}`" for k, v in top3
-        )
+    async def learn_from_outcome(self, site_game: str, session_id: int, predicted: str, actual: str,
+                                 confidence: int, algo_votes: Dict):
+        try:
+            correct = 1 if predicted == actual else 0
+            await db.execute(
+                "INSERT OR IGNORE INTO predictions (site_game, session_id, predicted, confidence, actual, correct, reason, timestamp, algo_votes) VALUES (?,?,?,?,?,?,?,?,?)",
+                (site_game, session_id, predicted, confidence, actual, correct, "auto", time.time(), json.dumps(algo_votes))
+            )
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"learn DB error: {e}")
+        # update weights
+        try:
+            cur_w = self.weights.get(site_game, DEFAULT_ALGO_WEIGHTS.copy())
+            for algo_name, info in algo_votes.items():
+                if info.get("pred") == actual:
+                    cur_w[algo_name] = min(WEIGHT_MAX, cur_w.get(algo_name, 1.0) * WEIGHT_INC)
+                else:
+                    cur_w[algo_name] = max(WEIGHT_MIN, cur_w.get(algo_name, 1.0) * WEIGHT_DEC)
+            self.weights[site_game] = cur_w
+            await self.save_weights_to_db(site_game)
+        except Exception as e:
+            logger.warning(f"learn weight update error: {e}")
 
-        results.append(
-            f"{GAME_LABEL[game]}\n"
-            f"📚 *Chính xác gần đây:* `{int(acc * 100)}%`\n"
-            f"🔧 *Thuật toán mạnh nhất:*\n{top_str}"
-        )
+# ---------------------------- BACKGROUND TASK -------------------------
+async def background_fetch_and_learn(bot: Bot):
+    logger.info("Background task started")
+    while not _shutdown_event.is_set():
+        try:
+            if await is_maintenance():
+                await asyncio.sleep(10)
+                continue
+            for game_key, game_conf in GAME_MAP.items():
+                if _shutdown_event.is_set():
+                    break
+                try:
+                    await _process_game(bot, game_key, game_conf)
+                except Exception as e:
+                    logger.error(f"_process_game {game_key}: {e}\n{traceback.format_exc()}")
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Background loop error: {e}\n{traceback.format_exc()}")
+            await asyncio.sleep(10)
+    logger.info("Background task stopped")
 
-    if not results:
-        await update.message.reply_text(
-            "⚠️ *Chưa đủ dữ liệu để học.*\nChạy thêm nhiều phiên để tích lũy!",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
+    sessions = await fetch_api(game_conf["url"])
+    if not sessions:
         return
+    try:
+        sessions.sort(key=lambda x: int(x.get("id", 0)), reverse=True)
+    except:
+        return
+    latest = sessions[0]
+    latest_id = int(latest.get("id", 0))
+    if latest_id == 0:
+        return
+    async with db.execute("SELECT 1 FROM sessions WHERE site_game=? AND session_id=?", (game_key, latest_id)) as cur:
+        if await cur.fetchone():
+            return
+    entry = parse_session_entry(latest)
+    try:
+        await db.execute(
+            "INSERT OR IGNORE INTO sessions (site_game, session_id, result, dices, point, timestamp) VALUES (?,?,?,?,?,?)",
+            (game_key, entry["id"], entry["result"], json.dumps(entry["dices"]), entry["point"], time.time())
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"Insert session error {game_key}: {e}")
+        return
+    await clean_old_sessions(game_key)
+    async with db.execute(
+        "SELECT result, dices, point FROM sessions WHERE site_game=? ORDER BY session_id DESC LIMIT 200",
+        (game_key,)
+    ) as cur:
+        rows = await cur.fetchall()
+    if not rows:
+        return
+    history = [{"result": r[0], "dices": _safe_json(r[1], []), "point": r[2] or 0} for r in rows]
+    # check pending prediction for previous session
+    async with db.execute(
+        "SELECT id, predicted, confidence, algo_votes FROM predictions WHERE site_game=? AND session_id=? AND actual IS NULL ORDER BY id DESC LIMIT 1",
+        (game_key, latest_id - 1)
+    ) as cur:
+        pending = await cur.fetchone()
+    if pending:
+        actual = history[0]["result"]
+        algo_votes = _safe_json(pending[3], {})
+        await ai_engine.learn_from_outcome(game_key, latest_id - 1, pending[1], actual, pending[2], algo_votes)
+    # predict next session
+    pred, conf, reason, votes = ai_engine.predict(history, game_key)
+    try:
+        await db.execute(
+            "INSERT OR IGNORE INTO predictions (site_game, session_id, predicted, confidence, reason, timestamp, algo_votes) VALUES (?,?,?,?,?,?,?)",
+            (game_key, latest_id + 1, pred, conf, reason, time.time(), json.dumps(votes))
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"Insert prediction error {game_key}: {e}")
+    # broadcast to watchers
+    watchers = list(user_watches.get(game_key, []))
+    if not watchers:
+        return
+    last = history[0]
+    dice_str = " ".join(DICE_EMO.get(int(d), str(d)) for d in last["dices"] if d)
+    pred_emoji = "🔴 TÀI" if pred == "TAI" else "🔵 XỈU"
+    res_emoji = "🔴 TÀI" if last["result"] == "TAI" else "🔵 XỈU"
+    msg = (
+        f"{game_conf['label']}\n━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 *Phiên:* `{latest_id + 1}`\n"
+        f"💡 *Dự đoán:* {pred_emoji} ({conf}%)\n"
+        f"📋 *Lý do:* {reason}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"⏮ *Phiên trước:* `{latest_id}`\n"
+        f"🎲 *Xúc xắc:* {dice_str} _( Σ {last['point']} )_\n"
+        f"🏆 *Kết quả:* {res_emoji}\n"
+        f"⏰ *Time:* `{datetime.now().strftime('%H:%M:%S')}`"
+    )
+    to_remove = []
+    for uid in watchers:
+        if _shutdown_event.is_set():
+            break
+        if await is_user_valid(uid):
+            if not await safe_send(bot, uid, msg, parse_mode=ParseMode.MARKDOWN):
+                to_remove.append(uid)
+    for uid in to_remove:
+        if uid in user_watches.get(game_key, []):
+            user_watches[game_key].remove(uid)
 
+async def clean_old_sessions(site_game: str):
+    try:
+        await db.execute(
+            """DELETE FROM sessions WHERE site_game=? AND id NOT IN (
+                SELECT id FROM sessions WHERE site_game=? ORDER BY session_id DESC LIMIT ?
+            )""", (site_game, site_game, MAX_SESSION_HISTORY)
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"clean_old_sessions error: {e}")
+
+# ---------------------------- TYPING MIDDLEWARE -----------------------
+async def typing_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if update.effective_message and update.effective_user and update.effective_chat:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    except:
+        pass
+
+# ---------------------------- USER HANDLERS ---------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    now = time.time()
+    try:
+        await db.execute(
+            "INSERT INTO users (user_id, username, full_name, joined_date, last_active) VALUES (?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name, last_active=excluded.last_active",
+            (user.id, user.username or "", user.full_name or "N/A", now, now)
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"start DB error: {e}")
+    if not await is_user_valid(user.id):
+        await update.message.reply_text(f"🔐 Bạn chưa kích hoạt key hoặc key hết hạn.\nDùng /muakey để mua hoặc liên hệ {SUPPORT_USERNAME}")
+        return
+    keyboard = [
+        [KeyboardButton("🎮 Bắt đầu dự đoán")],
+        [KeyboardButton("ℹ️ Tài khoản"), KeyboardButton("🛒 Mua Key")],
+        [KeyboardButton("🛑 Dừng dự đoán"), KeyboardButton("📜 Lịch sử")],
+        [KeyboardButton("📞 Liên hệ CSKH")],
+    ]
     await update.message.reply_text(
-        "🧠 *Đã học tập & nâng cấp thuật toán!*\n\n" + "\n\n".join(results),
+        f"👋 Chào *{user.full_name}*!\nChọn chức năng:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode=ParseMode.MARKDOWN,
     )
 
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.message
+    if not user or not msg:
+        return
+    if user.id in active_chats:
+        other = active_chats[user.id]
+        if msg.text and not msg.text.startswith("/"):
+            await relay_message(context.bot, user.id, other, msg.text)
+        return
+    if not await check_antispam(user.id):
+        await msg.reply_text("⚠️ Thao tác quá nhanh, vui lòng chờ.")
+        return
+    if not await is_user_valid(user.id):
+        await msg.reply_text("🔐 Key không hợp lệ hoặc hết hạn. /muakey")
+        return
+    text = msg.text or ""
+    if text == "🎮 Bắt đầu dự đoán":
+        kb = [[InlineKeyboardButton(conf["label"], callback_data=f"start_game|{gkey}")] for gkey, conf in GAME_MAP.items()]
+        kb.append([InlineKeyboardButton("❌ Thoát", callback_data="cancel")])
+        await msg.reply_text("Chọn game:", reply_markup=InlineKeyboardMarkup(kb))
+    elif text == "ℹ️ Tài khoản":
+        await cmd_info(update, context)
+    elif text == "🛒 Mua Key":
+        await cmd_muakey(update, context)
+    elif text == "🛑 Dừng dự đoán":
+        await cmd_stop(update, context)
+    elif text == "📜 Lịch sử":
+        await cmd_history(update, context)
+    elif text == "📞 Liên hệ CSKH":
+        await cmd_cskh(update, context)
+    else:
+        await msg.reply_text("Vui lòng chọn chức năng từ menu.")
 
-async def cmd_his(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    lines = []
-    for game, st in STATE.items():
-        preds = list(st["preds"])
-        if not preds:
-            continue
-        lines.append(f"{GAME_LABEL[game]}")
-        lines.append("`Phiên      Dự Đoán  KQ      Kết`")
-        lines.append("`" + "─" * 34 + "`")
-        for p in preds[:20]:
-            pd = "TÀI " if p["pred"]   == "TAI" else "XỈU "
-            ac = "TÀI " if p["actual"] == "TAI" else "XỈU "
-            rs = "✅" if p["correct"] else "❌"
-            lines.append(f"`{str(p['id']):<10} {pd:<9}{ac:<8}` {rs}")
-        lines.append("")
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data or ""
+    user = query.from_user
+    if data == "cancel":
+        try:
+            await query.message.delete()
+        except:
+            pass
+        return
+    if data.startswith("start_game|"):
+        parts = data.split("|", 1)
+        if len(parts) < 2:
+            return
+        game_key = parts[1]
+        if game_key not in GAME_MAP:
+            await query.answer("Game không hợp lệ!", show_alert=True)
+            return
+        if user.id not in user_watches[game_key]:
+            user_watches[game_key].append(user.id)
+        try:
+            await query.message.delete()
+        except:
+            pass
+        await safe_send(context.bot, user.id, f"🚀 Đã theo dõi *{GAME_MAP[game_key]['label']}*\nBot sẽ tự động gửi dự đoán khi có phiên mới.", parse_mode=ParseMode.MARKDOWN)
 
-    if not lines:
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    try:
+        async with db.execute(
+            "SELECT k.key, k.days, k.created FROM user_keys uk JOIN keys k ON uk.key=k.key WHERE uk.user_id=?", (uid,)
+        ) as cur:
+            ki = await cur.fetchone()
+        if not ki:
+            await update.message.reply_text("❌ Chưa có key.")
+            return
+        key, days, created = ki
+        expiry = datetime.fromtimestamp(created + days * 86400).strftime("%d/%m/%Y %H:%M")
+        remaining = max(0, int((created + days * 86400 - time.time()) / 3600))
+        status = "✅ Còn hạn" if remaining > 0 else "❌ Hết hạn"
         await update.message.reply_text(
-            "⚠️ *Chưa có lịch sử dự đoán.*",
+            f"🔑 *Key:* `{key}`\n⏳ *Hết hạn:* {expiry}\n🕐 *Còn lại:* ~{remaining}h\n📌 *Trạng thái:* {status}",
             parse_mode=ParseMode.MARKDOWN,
         )
+    except Exception as e:
+        logger.error(f"cmd_info error: {e}")
+        await update.message.reply_text("⚠️ Lỗi lấy thông tin.")
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    removed = 0
+    for gkey in list(user_watches.keys()):
+        if uid in user_watches[gkey]:
+            user_watches[gkey].remove(uid)
+            removed += 1
+    if removed:
+        await update.message.reply_text(f"🛑 Đã dừng theo dõi {removed} game.")
+    else:
+        await update.message.reply_text("ℹ️ Bạn chưa theo dõi game nào.")
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    try:
+        async with db.execute(
+            "SELECT site_game, session_id, predicted, actual, correct, timestamp FROM predictions WHERE user_id=? ORDER BY id DESC LIMIT 15", (uid,)
+        ) as cur:
+            rows = await cur.fetchall()
+        if not rows:
+            await update.message.reply_text("📭 Chưa có lịch sử dự đoán.")
+            return
+        lines = ["📜 *Lịch sử dự đoán:*"]
+        for r in rows:
+            label = GAME_MAP.get(r[0], {}).get("label", r[0])
+            pred, actual = r[2] or "?", r[3] or "?"
+            correct = "✅" if r[4] == 1 else ("❌" if r[3] else "🔄")
+            t = datetime.fromtimestamp(r[5]).strftime("%d/%m %H:%M")
+            lines.append(f"• {label} | P{r[1]} | {pred}→{actual} {correct} | {t}")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"cmd_history error: {e}")
+        await update.message.reply_text("⚠️ Lỗi lấy lịch sử.")
+
+async def cmd_muakey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
         return
+    kb = [
+        [InlineKeyboardButton("1 Ngày - 15,000đ", callback_data="buy_key_1")],
+        [InlineKeyboardButton("7 Ngày - 70,000đ", callback_data="buy_key_7")],
+        [InlineKeyboardButton("30 Ngày - 360,000đ", callback_data="buy_key_30")],
+        [InlineKeyboardButton("❌ Hủy", callback_data="cancel")],
+    ]
+    await update.message.reply_text("💳 *Chọn gói key:*", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+async def buy_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data or ""
+    user = query.from_user
+    if data.startswith("buy_key_"):
+        days_str = data.split("_")[-1]
+        if days_str not in PRICE_PLANS:
+            await query.answer("Gói không hợp lệ!", show_alert=True)
+            return
+        amount = PRICE_PLANS[days_str]
+        now_ts = int(time.time())
+        note = f"Nap{user.id}{now_ts}"
+        qr_url = f"https://img.vietqr.io/image/MB-009100981-compact.png?amount={amount}&addInfo={note}&accountName=NGUYEN%20HOANG%20QUOC%20CUONG"
+        kb = [
+            [InlineKeyboardButton("✅ Đã chuyển khoản", callback_data=f"paid|{now_ts}|{days_str}")],
+            [InlineKeyboardButton("❌ Hủy", callback_data="cancel")],
+        ]
+        try:
+            await query.message.delete()
+        except:
+            pass
+        try:
+            await context.bot.send_photo(
+                chat_id=user.id, photo=qr_url,
+                caption=f"💳 *Thanh toán:* {amount:,}đ\n📝 *Nội dung CK:* `{note}`\n⏳ Bấm nút sau khi đã chuyển khoản.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+        except Exception as e:
+            logger.error(f"buy_key send_photo error: {e}")
+            await safe_send(context.bot, user.id, f"⚠️ Lỗi hiển thị QR. Liên hệ {SUPPORT_USERNAME}")
+    elif data.startswith("paid|"):
+        parts = data.split("|")
+        if len(parts) < 3:
+            return
+        _, ts, days_str = parts[0], parts[1], parts[2]
+        if days_str not in PRICE_PLANS:
+            return
+        amount = PRICE_PLANS[days_str]
+        for admin_id in ADMIN_IDS:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Duyệt", callback_data=f"approve_pay|{user.id}|{ts}|{days_str}"),
+                 InlineKeyboardButton("❌ Từ chối", callback_data=f"reject_pay|{user.id}|{ts}")]
+            ])
+            await safe_send(context.bot, admin_id,
+                f"🔔 *Yêu cầu mua key*\n👤 {user.full_name} (`{user.id}`)\n📝 ND: Nap{user.id}{ts}\n📦 Gói: {days_str} ngày - {amount:,}đ",
+                parse_mode=ParseMode.MARKDOWN)
+            try:
+                await context.bot.send_message(admin_id, "👆 Hành động:", reply_markup=kb)
+            except:
+                pass
+        try:
+            await query.message.edit_caption("✅ *Đã gửi yêu cầu.*\nAdmin sẽ xác nhận sớm.", parse_mode=ParseMode.MARKDOWN)
+        except:
+            pass
 
+# ---------------------------- ADMIN APPROVE ----------------------------
+async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    if not is_admin(query.from_user.id):
+        await query.answer("Không có quyền!", show_alert=True)
+        return
+    await query.answer()
+    parts = (query.data or "").split("|")
+    if parts[0] == "approve_pay" and len(parts) >= 4:
+        try:
+            uid = int(parts[1])
+            ts = parts[2]
+            days_str = parts[3]
+            days = int(days_str)
+            amount = PRICE_PLANS.get(days_str, 0)
+        except:
+            await query.edit_message_text("❌ Dữ liệu không hợp lệ")
+            return
+        key = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=16))
+        now = time.time()
+        try:
+            await db.execute("INSERT OR REPLACE INTO keys (key, days, created, created_by) VALUES (?,?,?,?)", (key, days, now, query.from_user.id))
+            await db.execute("INSERT OR REPLACE INTO user_keys (user_id, key, activated) VALUES (?,?,?)", (uid, key, now))
+            await db.execute("INSERT OR REPLACE INTO payments (id, user_id, amount, days, timestamp, status, handled_by) VALUES (?,?,?,?,?,?,?)",
+                             (f"{uid}_{int(now)}", uid, amount, days, now, "approved", query.from_user.id))
+            await db.commit()
+        except Exception as e:
+            logger.error(f"approve_pay DB error: {e}")
+            await query.edit_message_text(f"❌ Lỗi DB: {e}")
+            return
+        expiry = datetime.fromtimestamp(now + days * 86400).strftime("%d/%m/%Y %H:%M")
+        await safe_send(context.bot, uid, f"🎉 *Key đã được kích hoạt!*\n🔑 `{key}`\n📦 Gói: {days} ngày\n⏳ Hết hạn: {expiry}", parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(f"✅ Đã cấp key cho user {uid}: `{key}`", parse_mode=ParseMode.MARKDOWN)
+    elif parts[0] == "reject_pay" and len(parts) >= 2:
+        uid = int(parts[1])
+        await safe_send(context.bot, uid, "❌ Yêu cầu mua key bị từ chối.")
+        await query.edit_message_text(f"❌ Đã từ chối user {uid}")
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stop",  cmd_stop))
-    app.add_handler(CommandHandler("hoc",   cmd_hoc))
-    app.add_handler(CommandHandler("his",   cmd_his))
-    print("✅ Bot đang chạy...")
-    app.run_polling(drop_pending_updates=True)
+# ---------------------------- CSKH -------------------------------------
+active_chats = {}  # user_id <-> cskh_id
 
+async def relay_message(bot: Bot, sender_id: int, receiver_id: int, text: str):
+    prefix = "📩 Từ CSKH" if sender_id in CSKH_USER_IDS else f"📩 Khách `{sender_id}`"
+    await safe_send(bot, receiver_id, f"{prefix}:\n{text}", parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_cskh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    if user.id in active_chats:
+        await update.message.reply_text("🟢 Bạn đang trong cuộc trò chuyện với CSKH.")
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Chấp nhận", callback_data=f"cskh_accept|{user.id}"),
+         InlineKeyboardButton("❌ Từ chối", callback_data=f"cskh_reject|{user.id}")]
+    ])
+    mention = " ".join(f'<a href="tg://user?id={uid}">CSKH</a>' for uid in CSKH_USER_IDS)
+    try:
+        await context.bot.send_message(CSKH_GROUP_ID, f"🔔 Yêu cầu hỗ trợ từ <b>{user.full_name}</b> (<code>{user.id}</code>)\n{mention}", parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        logger.warning(f"cmd_cskh send group error: {e}")
+        await update.message.reply_text(f"⚠️ Không liên hệ được nhóm CSKH. Liên hệ trực tiếp: {SUPPORT_USERNAME}")
+        return
+    await update.message.reply_text("📩 Đã gửi yêu cầu. Vui lòng chờ CSKH kết nối.")
+
+async def cskh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    cskh_uid = query.from_user.id
+    if cskh_uid not in CSKH_USER_IDS:
+        await query.answer("Không phải CSKH!", show_alert=True)
+        return
+    await query.answer()
+    parts = (query.data or "").split("|")
+    if parts[0] == "cskh_accept" and len(parts) >= 2:
+        user_id = int(parts[1])
+        active_chats[user_id] = cskh_uid
+        active_chats[cskh_uid] = user_id
+        await safe_send(context.bot, user_id, "✅ CSKH đã kết nối. Nhắn tin tại đây.\nGõ /ketthuc để kết thúc.")
+        await query.edit_message_text(f"✅ Đã nhận hỗ trợ cho user {user_id}.\nTrả lời ngay trong chat.")
+    elif parts[0] == "cskh_reject" and len(parts) >= 2:
+        user_id = int(parts[1])
+        await safe_send(context.bot, user_id, "❌ CSKH hiện không khả dụng. Thử lại sau.")
+        await query.edit_message_text(f"❌ Đã từ chối user {user_id}")
+
+async def cmd_ketthuc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    if user.id not in active_chats:
+        await update.message.reply_text("ℹ️ Không có cuộc trò chuyện nào đang mở.")
+        return
+    other = active_chats.pop(user.id, None)
+    if other:
+        active_chats.pop(other, None)
+        await safe_send(context.bot, other, "🔚 Cuộc trò chuyện đã kết thúc.")
+    await update.message.reply_text("🔚 Đã kết thúc chat CSKH.")
+
+# ---------------------------- ADMIN COMMANDS ---------------------------
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Thống kê", callback_data="admin_stats")],
+        [InlineKeyboardButton("💰 Thu nhập", callback_data="admin_income")],
+        [InlineKeyboardButton("🔧 Bảo trì ON", callback_data="admin_maint_on"), InlineKeyboardButton("🔧 OFF", callback_data="admin_maint_off")],
+        [InlineKeyboardButton("📜 Log học tập", callback_data="admin_hoclog")],
+        [InlineKeyboardButton("👥 Danh sách user", callback_data="admin_users")],
+        [InlineKeyboardButton("🔑 Create Key", callback_data="admin_createkey"), InlineKeyboardButton("🗑 Xoá key", callback_data="admin_delkey")],
+    ])
+    await update.message.reply_text("🛡 *Admin Menu*", reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not is_admin(query.from_user.id):
+        if query:
+            await query.answer("Không có quyền!", show_alert=True)
+        return
+    await query.answer()
+    data = query.data or ""
+    if data == "admin_stats":
+        try:
+            async with db.execute("SELECT COUNT(*) FROM users") as c: user_cnt = (await c.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM user_keys") as c: key_cnt = (await c.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM predictions") as c: pred_cnt = (await c.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM predictions WHERE correct=1") as c: correct_cnt = (await c.fetchone())[0]
+            acc = f"{correct_cnt/pred_cnt*100:.1f}%" if pred_cnt else "N/A"
+            watchers = sum(len(v) for v in user_watches.values())
+            await query.message.reply_text(
+                f"📊 *Thống kê Bot*\n👥 Users: {user_cnt}\n🔑 Keys đã cấp: {key_cnt}\n🤖 Dự đoán: {pred_cnt}\n🎯 Độ chính xác: {acc}\n👀 Đang theo dõi: {watchers} slot",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            await query.message.reply_text(f"⚠️ Lỗi: {e}")
+    elif data == "admin_income":
+        try:
+            async with db.execute("SELECT SUM(amount) FROM payments WHERE status='approved'") as c:
+                total = (await c.fetchone())[0] or 0
+            async with db.execute("SELECT COUNT(*) FROM payments WHERE status='approved'") as c:
+                count = (await c.fetchone())[0]
+            await query.message.reply_text(f"💰 *Tổng thu nhập:* {total:,}đ\n📦 Số giao dịch thành công: {count}", parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            await query.message.reply_text(f"⚠️ Lỗi: {e}")
+    elif data == "admin_maint_on":
+        await db.execute("UPDATE bot_config SET value='1' WHERE key='maintenance'"); await db.commit()
+        await query.message.reply_text("🔧 Chế độ bảo trì: *BẬT*", parse_mode=ParseMode.MARKDOWN)
+    elif data == "admin_maint_off":
+        await db.execute("UPDATE bot_config SET value='0' WHERE key='maintenance'"); await db.commit()
+        await query.message.reply_text("✅ Chế độ bảo trì: *TẮT*", parse_mode=ParseMode.MARKDOWN)
+    elif data == "admin_hoclog":
+        try:
+            async with db.execute(
+                "SELECT site_game, session_id, predicted, actual, correct FROM predictions ORDER BY id DESC LIMIT 15"
+            ) as cur:
+                rows = await cur.fetchall()
+            if not rows:
+                await query.message.reply_text("📭 Chưa có log.")
+                return
+            lines = ["📈 *Log học tập (15 mới nhất):*"]
+            for r in rows:
+                label = GAME_MAP.get(r[0], {}).get("label", r[0])
+                correct = "✅" if r[4] == 1 else "❌"
+                lines.append(f"• {label} | P{r[1]} | {r[2]}→{r[3] or '?'} {correct}")
+            await query.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            await query.message.reply_text(f"⚠️ Lỗi: {e}")
+    elif data == "admin_users":
+        try:
+            async with db.execute("SELECT user_id, username, banned FROM users ORDER BY joined_date DESC LIMIT 20") as cur:
+                users = await cur.fetchall()
+            if not users:
+                await query.message.reply_text("Chưa có user.")
+                return
+            text = "👥 *Danh sách user (20 gần nhất):*\n"
+            for uid, uname, banned in users:
+                status = "🚫" if banned else "✅"
+                text += f"• {status} `{uid}` - {uname or 'N/A'}\n"
+            await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            await query.message.reply_text(f"⚠️ Lỗi: {e}")
+
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    msg = update.message.reply_to_message
+    try:
+        async with db.execute("SELECT user_id FROM users WHERE banned=0") as c:
+            users = await c.fetchall()
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Lỗi DB: {e}")
+        return
+    count = 0
+    for (uid,) in users:
+        try:
+            if msg:
+                await context.bot.copy_message(chat_id=uid, from_chat_id=update.message.chat_id, message_id=msg.message_id)
+            elif context.args:
+                text = " ".join(context.args)
+                await context.bot.send_message(uid, text)
+            else:
+                break
+            count += 1
+        except Forbidden:
+            pass
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except:
+            pass
+        await asyncio.sleep(0.05)
+    await update.message.reply_text(f"✅ Đã gửi đến {count}/{len(users)} người.")
+
+async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Dùng: /ban <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except:
+        await update.message.reply_text("❌ user_id không hợp lệ.")
+        return
+    await db.execute("UPDATE users SET banned=1 WHERE user_id=?", (uid,))
+    await db.commit()
+    for gkey in list(user_watches.keys()):
+        if uid in user_watches[gkey]:
+            user_watches[gkey].remove(uid)
+    await update.message.reply_text(f"✅ Đã ban user {uid}")
+
+async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Dùng: /unban <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except:
+        await update.message.reply_text("❌ user_id không hợp lệ.")
+        return
+    await db.execute("UPDATE users SET banned=0 WHERE user_id=?", (uid,))
+    await db.commit()
+    await update.message.reply_text(f"✅ Đã unban user {uid}")
+
+async def admin_setkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cấp key thủ công: /setkey <user_id> <days>"""
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args or []) < 2:
+        await update.message.reply_text("Dùng: /setkey <user_id> <days>")
+        return
+    try:
+        uid = int(context.args[0])
+        days = int(context.args[1])
+        if days <= 0:
+            raise ValueError
+    except:
+        await update.message.reply_text("❌ Tham số không hợp lệ.")
+        return
+    key = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=16))
+    now = time.time()
+    await db.execute("INSERT OR REPLACE INTO keys (key, days, created, created_by) VALUES (?,?,?,?)", (key, days, now, update.effective_user.id))
+    await db.execute("INSERT OR REPLACE INTO user_keys (user_id, key, activated) VALUES (?,?,?)", (uid, key, now))
+    await db.commit()
+    expiry = datetime.fromtimestamp(now + days * 86400).strftime("%d/%m/%Y %H:%M")
+    await safe_send(context.bot, uid, f"🎉 *Key mới được cấp!*\n🔑 `{key}`\n⏳ Hết hạn: {expiry}", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"✅ Đã cấp key `{key}` cho user {uid}", parse_mode=ParseMode.MARKDOWN)
+
+async def admin_delkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xoá key của user: /delkey <user_id>"""
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Dùng: /delkey <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+    except:
+        await update.message.reply_text("❌ user_id không hợp lệ.")
+        return
+    await db.execute("DELETE FROM user_keys WHERE user_id=?", (uid,))
+    await db.commit()
+    await update.message.reply_text(f"✅ Đã xoá key của user {uid}")
+
+async def admin_editkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gia hạn key: /editkey <user_id> <thêm_days>"""
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args or []) < 2:
+        await update.message.reply_text("Dùng: /editkey <user_id> <thêm_days>")
+        return
+    try:
+        uid = int(context.args[0])
+        add_days = int(context.args[1])
+        if add_days <= 0:
+            raise ValueError
+    except:
+        await update.message.reply_text("❌ Tham số không hợp lệ.")
+        return
+    async with db.execute("SELECT k.key, k.days, k.created FROM user_keys uk JOIN keys k ON uk.key=k.key WHERE uk.user_id=?", (uid,)) as cur:
+        key_info = await cur.fetchone()
+    if not key_info:
+        await update.message.reply_text("❌ User chưa có key.")
+        return
+    key, old_days, created = key_info
+    new_days = old_days + add_days
+    # Tạo key mới với số ngày mới
+    new_key = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=16))
+    now = time.time()
+    await db.execute("INSERT OR REPLACE INTO keys (key, days, created, created_by) VALUES (?,?,?,?)", (new_key, new_days, now, update.effective_user.id))
+    await db.execute("UPDATE user_keys SET key=? WHERE user_id=?", (new_key, uid))
+    await db.commit()
+    expiry = datetime.fromtimestamp(now + new_days * 86400).strftime("%d/%m/%Y %H:%M")
+    await safe_send(context.bot, uid, f"🔄 *Key đã được gia hạn!*\n🔑 `{new_key}`\n⏳ Hết hạn mới: {expiry}", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"✅ Đã gia hạn thêm {add_days} ngày cho user {uid}")
+
+# ---------------------------- ERROR HANDLER ---------------------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, (NetworkError, asyncio.TimeoutError)):
+        logger.warning(f"Network error: {err}")
+        return
+    if isinstance(err, Forbidden):
+        logger.info(f"Forbidden (user blocked): {err}")
+        return
+    logger.error(f"Unhandled error: {err}\n{traceback.format_exc()}")
+
+# ---------------------------- MAIN ------------------------------------
+async def main():
+    global ai_engine
+    setup_logging()
+    logger.info("Starting bot...")
+    await init_db()
+    ai_engine = AIEngine()
+    await ai_engine.load_weights_from_db()
+
+    app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
+    app.add_handler(MessageHandler(filters.ALL, typing_middleware), group=-1)
+    # user commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("info", cmd_info))
+    app.add_handler(CommandHandler("muakey", cmd_muakey))
+    app.add_handler(CommandHandler("ketthuc", cmd_ketthuc))
+    app.add_handler(CommandHandler("nhancskh", cmd_cskh))
+    # admin commands
+    app.add_handler(CommandHandler("admin", admin_menu))
+    app.add_handler(CommandHandler("broadcast", admin_broadcast))
+    app.add_handler(CommandHandler("ban", admin_ban))
+    app.add_handler(CommandHandler("unban", admin_unban))
+    app.add_handler(CommandHandler("setkey", admin_setkey))
+    app.add_handler(CommandHandler("delkey", admin_delkey))
+    app.add_handler(CommandHandler("editkey", admin_editkey))
+    # callbacks
+    app.add_handler(CallbackQueryHandler(admin_approve_callback, pattern=r"^(approve_pay|reject_pay)\|"))
+    app.add_handler(CallbackQueryHandler(cskh_callback, pattern=r"^cskh_"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
+    app.add_handler(CallbackQueryHandler(buy_key_callback, pattern=r"^(buy_key_|paid\|)"))
+    app.add_handler(CallbackQueryHandler(button_callback, pattern=r"^(start_game\||cancel)"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
+    app.add_error_handler(error_handler)
+
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start","Bắt đầu"), BotCommand("stop","Dừng dự đoán"),
+            BotCommand("history","Lịch sử"), BotCommand("info","Tài khoản"),
+            BotCommand("muakey","Mua key"), BotCommand("nhancskh","Hỗ trợ"),
+            BotCommand("ketthuc","Kết thúc chat"), BotCommand("admin","Quản trị"),
+        ])
+    except Exception as e:
+        logger.warning(f"set_my_commands error: {e}")
+
+    bg_task = None
+    try:
+        async with app:
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+            bg_task = asyncio.create_task(background_fetch_and_learn(app.bot))
+            logger.info("✅ Bot đang chạy. Ctrl+C để dừng.")
+            loop = asyncio.get_running_loop()
+            def stop_handler(*_):
+                _shutdown_event.set()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, stop_handler)
+                except:
+                    pass
+            await _shutdown_event.wait()
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received")
+    except Exception as e:
+        logger.critical(f"main error: {e}\n{traceback.format_exc()}")
+    finally:
+        _shutdown_event.set()
+        if bg_task and not bg_task.done():
+            bg_task.cancel()
+            try:
+                await asyncio.wait_for(bg_task, timeout=5)
+            except:
+                pass
+        if app.updater.running:
+            await app.updater.stop()
+        if app.running:
+            await app.stop()
+        await close_db()
+        logger.info("Bot stopped")
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
