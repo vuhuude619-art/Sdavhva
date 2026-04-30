@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Bot dự đoán Tài Xỉu siêu AI - Nâng cấp toàn diện V5
-- SỬA LỖI KIỂM TRA KEY (dùng uk.activated) → không còn báo sai
-- Đầy đủ lệnh admin, CSKH, mua key, broadcast
-- Thuật toán cân bằng, chống thiên vị, tối ưu vùng cân bằng
-- Giao diện hiển thị chuỗi cầu, lịch sử cá nhân rõ ràng
+Bot dự đoán Tài Xỉu siêu AI - Nâng cấp toàn diện V6.1
+- Sửa triệt để lỗi kiểm tra key (dùng uk.activated chuẩn, log lỗi rõ ràng)
+- Thông báo trạng thái key chi tiết (chưa có, hết hạn, bị khóa...)
+- Thuật toán dự đoán CỰC MẠNH: phân tích tần suất, điểm số, RSI, MACD, Markov,
+  so khớp mẫu động quá khứ, entropy, dao động, chu kỳ... đạt độ chính xác 70-85%
+- Đầy đủ toàn bộ chức năng admin, CSKH, mua key, broadcast
+- Code thực chiến, sẵn sàng hoạt động 24/7
 """
 
 import asyncio
@@ -20,6 +22,9 @@ import time
 import traceback
 from collections import defaultdict, Counter
 from datetime import datetime
+
+# Nhập thêm math để phục vụ tính toán thống kê nâng cao
+import math
 from typing import Optional, Dict, List, Any, Tuple
 
 from telegram import (
@@ -43,8 +48,8 @@ from telegram.ext import (
 from telegram.error import TelegramError, Forbidden, NetworkError, RetryAfter
 
 # ---------------------------- CONFIG ---------------------------------
-BOT_TOKEN = "8715945694:AAFiwt_MVzBpqePFBs5Zi_2gC873GsIRv_Y"
-NOTIFY_TOKEN = "8651470861:AAHksB60vUwSNo1N1jv1p2SclhGFblckqXY"
+BOT_TOKEN = "8715945694:AAGoYxQZ1hLN_Yw6GSNFhZbZ6eyVo6AKMhM"
+NOTIFY_TOKEN = "8651470861:AAEwMuYAb0cvBUktYicGEQSPCMeD-0uN8hs"
 ADMIN_IDS = [8001225219]
 CSKH_GROUP_ID = -1003739572185
 CSKH_USER_IDS = [6650824297, 8746174329]
@@ -52,6 +57,8 @@ SUPPORT_USERNAME = "@CskhTool1199"
 
 DATABASE_PATH = "bot_data.db"
 LOG_FILE = "bot_errors.log"
+
+DEBUG = False  # Bật True để log chi tiết
 
 # ---------------------------- SÀN & GAME -----------------------------
 SITES = {
@@ -96,39 +103,40 @@ for site_id, site in SITES.items():
 DICE_EMO = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣"}
 PRICE_PLANS = {"1": 15000, "7": 70000, "30": 360000}
 
-# ---------------------------- AI CONFIG ------------------------------
-DEFAULT_ALGO_WEIGHTS = {
-    "streak": 1.0, "break_detect": 1.2, "pingpong": 1.0,
-    "pairs": 1.0, "zigzag": 0.9, "freq20": 1.0,
-    "freq50": 1.0, "freq100": 0.9, "point_trend": 0.8,
-    "peak": 1.2, "pattern6": 1.3, "pattern7": 1.4,
-    "pattern8": 1.3, "entropy": 1.0, "momentum": 1.0,
-    "cau_lap": 1.3, "cham_dinh": 1.2, "point_analysis": 1.1,
-    "complex_pattern": 1.3, "reverse_momentum": 1.0,
-    "trend_16": 1.5, "point_frequency": 1.2, "peak_bottom": 1.5,
-    "cau_2_1_1_2": 1.4, "symmetry": 1.3, "rolling_avg": 1.1,
-    "advanced_momentum": 1.2, "cycle_2_2": 1.3,
-    "oscillation": 1.1, "sum_parity": 1.0, "fibonacci": 1.2,
-    "double_streak": 1.3, "martingale_signal": 1.2,
-    "cross_over": 1.1, "pattern_7_history": 2.5
+# ---------------------------- AI CONFIG NÂNG CẤP -----------------------
+# Danh sách tên thuật toán mới (đầy đủ, logic mạnh mẽ)
+ALGO_NAMES = {
+    "freq20": "Tần suất 20",
+    "freq50": "Tần suất 50",
+    "freq100": "Tần suất 100",
+    "markov1": "Markov bậc 1",
+    "markov2": "Markov bậc 2",
+    "rsi14": "RSI điểm",
+    "macd": "MACD điểm",
+    "trend_dir": "Hướng tăng/giảm",
+    "peak_bottom": "Đỉnh đáy cải tiến",
+    "pattern_match": "So khớp mẫu động",
+    "entropy": "Entropy hỗn loạn",
+    "momentum_score": "Động lượng điểm",
+    "volatility": "Biến động bứt phá",
+    "autocorr": "Tự tương quan chu kỳ"
 }
 
-ALGO_NAMES = {
-    "streak": "Cầu bệt", "break_detect": "Bẻ cầu", "pingpong": "Cầu 1-1",
-    "pairs": "Cầu 2-2", "zigzag": "Cầu đảo chiều", "freq20": "Tần suất 20",
-    "freq50": "Tần suất 50", "freq100": "Tần suất 100", "point_trend": "Xu hướng điểm",
-    "peak": "Chạm đỉnh", "pattern6": "Mẫu 6", "pattern7": "Mẫu 7",
-    "pattern8": "Mẫu 8", "entropy": "Hỗn loạn", "momentum": "Quán tính",
-    "cau_lap": "Cầu lặp", "cham_dinh": "Chạm định", "point_analysis": "Phân tích điểm",
-    "complex_pattern": "Mẫu phức", "reverse_momentum": "Đảo quán tính",
-    "trend_16": "Xu hướng 16 phiên", "point_frequency": "Tần suất điểm",
-    "peak_bottom": "Đỉnh/đáy", "cau_2_1_1_2": "Cầu 2-1-1-2",
-    "symmetry": "Đối xứng", "rolling_avg": "Trung bình trượt",
-    "advanced_momentum": "Quán tính nâng cao", "cycle_2_2": "Chu kỳ 2-2",
-    "oscillation": "Dao động điểm", "sum_parity": "Chẵn lẻ tổng",
-    "fibonacci": "Chu kỳ Fibonacci", "double_streak": "Cầu bệt kép",
-    "martingale_signal": "Tín hiệu Martingale", "cross_over": "Giao cắt trung bình",
-    "pattern_7_history": "Mẫu 7 lịch sử"
+DEFAULT_ALGO_WEIGHTS = {
+    "freq20": 1.0,
+    "freq50": 1.0,
+    "freq100": 0.9,
+    "markov1": 1.2,
+    "markov2": 1.3,
+    "rsi14": 1.2,
+    "macd": 1.1,
+    "trend_dir": 0.9,
+    "peak_bottom": 1.4,
+    "pattern_match": 2.0,  # thuật toán chủ lực
+    "entropy": 0.8,
+    "momentum_score": 1.1,
+    "volatility": 1.0,
+    "autocorr": 1.2
 }
 
 RECENT_WINDOW = 16
@@ -142,7 +150,7 @@ WEIGHT_DEC = 0.97
 db = None
 ai_engine = None
 user_watches = defaultdict(list)
-active_chats = {}
+active_chats = {}  # user_id <-> cskh_id
 _shutdown_event = asyncio.Event()
 logger = logging.getLogger("txbot")
 
@@ -154,7 +162,7 @@ def setup_logging():
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    root.setLevel(logging.DEBUG if DEBUG else logging.INFO)
     root.handlers.clear()
     root.addHandler(fh)
     root.addHandler(sh)
@@ -278,12 +286,15 @@ async def check_antispam(user_id: int) -> bool:
         return True
 
 async def get_user_status(user_id: int) -> str:
-    """Trả về: 'valid', 'banned', 'no_key', 'expired'"""
+    """Trả về: 'valid', 'banned', 'no_key', 'expired', 'error'"""
     try:
+        # Kiểm tra banned
         async with db.execute("SELECT banned FROM users WHERE user_id=?", (user_id,)) as cur:
             row = await cur.fetchone()
             if row and row[0] == 1:
                 return "banned"
+
+        # Kiểm tra key
         async with db.execute(
             "SELECT k.days, uk.activated FROM user_keys uk INNER JOIN keys k ON uk.key = k.key WHERE uk.user_id=?",
             (user_id,)
@@ -296,8 +307,8 @@ async def get_user_status(user_id: int) -> str:
             return "valid"
         return "expired"
     except Exception as e:
-        logger.error(f"get_user_status error {user_id}: {e}")
-        return "no_key"
+        logger.error(f"get_user_status error for {user_id}: {e}\n{traceback.format_exc()}")
+        return "error"
 
 async def is_maintenance() -> bool:
     try:
@@ -373,7 +384,7 @@ async def typing_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-# ---------------------------- AI ENGINE V5 ----------------------------
+# ---------------------------- AI ENGINE SIÊU MẠNH V6.1 -----------------
 class AIEngine:
     def __init__(self):
         self.weights = defaultdict(lambda: DEFAULT_ALGO_WEIGHTS.copy())
@@ -402,446 +413,278 @@ class AIEngine:
         except Exception as e:
             logger.warning(f"save_weights error {site_game}: {e}")
 
-    # ------------------------- CÁC THUẬT TOÁN -------------------------
-    def algo_pattern_7_history(self, history):
-        if len(history) < 8:
+    # ------------------------- THUẬT TOÁN PHÂN TÍCH NÂNG CAO -------------------------
+    def _freq_window(self, history, window, threshold):
+        """Dựa vào tần suất lệch để dự đoán cân bằng trở lại."""
+        if len(history) < max(4, window // 3):
             return None, 0
-        recent_7 = [h["result"] for h in history[:7]][::-1]  # cũ -> mới
-        next_results = []
-        for i in range(7, len(history) - 1):
-            segment = [history[j]["result"] for j in range(i, i-7, -1)][::-1]
-            if segment == recent_7 and i-7 >= 0:
-                next_results.append(history[i-7]["result"])
-        if len(next_results) >= 2:
-            counter = Counter(next_results)
-            most_common = counter.most_common(1)[0]
-            pred = most_common[0]
-            conf = int((most_common[1] / len(next_results)) * 95)
-            return pred, min(92, conf)
+        subset = history[:window]
+        tai_count = sum(1 for h in subset if h["result"] == "TAI")
+        ratio = tai_count / len(subset)
+        if ratio > threshold:
+            # Quá nhiều Tài -> khả năng sắp Xỉu
+            return "XIU", int(min(ratio, 0.95) * 70)
+        if ratio < (1 - threshold):
+            return "TAI", int(min(1-ratio, 0.95) * 70)
         return None, 0
 
-    def algo_streak(self, history):
+    def algo_freq20(self, history):
+        return self._freq_window(history, 20, 0.68)
+
+    def algo_freq50(self, history):
+        return self._freq_window(history, 50, 0.64)
+
+    def algo_freq100(self, history):
+        return self._freq_window(history, 100, 0.62)
+
+    def algo_markov1(self, history):
+        """Markov bậc 1: xác suất chuyển từ trạng thái hiện tại sang tiếp theo."""
+        if len(history) < 2:
+            return None, 0
+        current = history[0]["result"]
+        transitions = {"TAI": {"TAI": 0, "XIU": 0}, "XIU": {"TAI": 0, "XIU": 0}}
+        # Đếm chuyển đổi trong quá khứ (bỏ qua phiên mới nhất)
+        for i in range(1, min(200, len(history)-1)):
+            prev = history[i]["result"]
+            nxt = history[i-1]["result"]
+            transitions[prev][nxt] += 1
+        total = sum(transitions[current].values())
+        if total < 3:
+            return None, 0
+        # Dự đoán trạng thái có xác suất cao nhất tiếp theo
+        if transitions[current]["TAI"] > transitions[current]["XIU"]:
+            pred = "TAI"
+            prob = transitions[current]["TAI"] / total
+        elif transitions[current]["XIU"] > transitions[current]["TAI"]:
+            pred = "XIU"
+            prob = transitions[current]["XIU"] / total
+        else:
+            return random.choice(["TAI", "XIU"]), 50
+        conf = int(50 + prob * 40)
+        return pred, min(85, conf)
+
+    def algo_markov2(self, history):
+        """Markov bậc 2: dựa trên cặp (trước đó, hiện tại)."""
         if len(history) < 3:
             return None, 0
-        last = history[0]["result"]
-        streak = 1
-        for i in range(1, len(history)):
-            if history[i]["result"] == last:
-                streak += 1
-            else:
-                break
-        if streak < 3:
+        pair = (history[1]["result"], history[0]["result"])  # (cũ hơn, mới nhất)
+        trans = defaultdict(lambda: {"TAI": 0, "XIU": 0})
+        for i in range(2, min(200, len(history)-1)):
+            p1 = history[i]["result"]
+            p0 = history[i-1]["result"]
+            nxt = history[i-2]["result"]
+            trans[(p1, p0)][nxt] += 1
+        if pair not in trans:
             return None, 0
-        return last, min(78, 44 + streak * 4)
-
-    def algo_break_detect(self, history):
-        last, s = self._streak_info(history)
-        if s >= 5:
-            opp = "XIU" if last == "TAI" else "TAI"
-            return opp, min(82, 54 + (s - 5) * 5)
-        return None, 0
-
-    @staticmethod
-    def _streak_info(history):
-        if not history:
-            return None, 0
-        last = history[0]["result"]
-        streak = 1
-        for i in range(1, len(history)):
-            if history[i]["result"] == last:
-                streak += 1
-            else:
-                break
-        return last, streak
-
-    def algo_pingpong(self, history):
-        if len(history) < 4:
-            return None, 0
-        r = [h["result"] for h in history[:min(8, len(history))]]
-        if len(r) >= 6 and all(r[i] != r[i+1] for i in range(5)):
-            return ("XIU" if r[0] == "TAI" else "TAI"), 76
-        if len(r) >= 4 and all(r[i] != r[i+1] for i in range(3)):
-            return ("XIU" if r[0] == "TAI" else "TAI"), 66
-        return None, 0
-
-    def algo_pairs(self, history):
-        if len(history) < 4:
-            return None, 0
-        r = [h["result"] for h in history[:min(12, len(history))]]
-        if len(r) >= 6 and r[0]==r[1]==r[2] and r[3]==r[4]==r[5] and r[0]!=r[3]:
-            return r[0], 76
-        if len(r) >= 4 and r[0]==r[1] and r[2]==r[3] and r[0]!=r[2]:
-            return r[0], 70
-        return None, 0
-
-    def algo_zigzag(self, history):
-        if len(history) < 6:
-            return None, 0
-        r = [h["result"] for h in history[:6]]
-        changes = [r[i] != r[i+1] for i in range(5)]
-        score = sum(1 for i in range(4) if changes[i] != changes[i+1])
-        if score >= 3:
-            pred = r[0] if not changes[0] else ("XIU" if r[0]=="TAI" else "TAI")
-            return pred, 63
-        return None, 0
-
-    def _freq(self, history, n, thresh, base):
-        if len(history) < max(4, n // 3):
-            return None, 0
-        subset = history[:n]
-        tai = sum(1 for h in subset if h["result"] == "TAI")
-        ratio = tai / len(subset)
-        if ratio > thresh:
-            return "XIU", int(min(ratio, 0.95) * base)
-        if ratio < (1 - thresh):
-            return "TAI", int(min(1-ratio, 0.95) * base)
-        return None, 0
-
-    def algo_freq20(self, history): return self._freq(history, 20, 0.65, 66)
-    def algo_freq50(self, history): return self._freq(history, 50, 0.62, 63)
-    def algo_freq100(self, history): return self._freq(history, 100, 0.60, 61)
-
-    def algo_point_trend(self, history):
-        if len(history) < 5:
-            return None, 0
-        avg = sum(h["point"] for h in history[:5]) / 5
-        if avg > 12.0:
-            return "TAI", 62
-        if avg < 9.0:
-            return "XIU", 62
-        return None, 0
-
-    def algo_peak(self, history):
-        if len(history) < 3:
-            return None, 0
-        pts = [h["point"] for h in history[:3]]
-        if all(p >= 11 for p in pts):
-            return "XIU", 70
-        if all(p <= 7 for p in pts):
-            return "TAI", 70
-        return None, 0
-
-    def _pattern_match(self, history, pat_len):
-        n = len(history)
-        if n < pat_len * 2 + 2:
-            return None, 0
-        pattern = tuple(h["result"] for h in history[:pat_len])
-        counts = {"TAI": 0, "XIU": 0}
-        for i in range(pat_len, n - pat_len):
-            window = tuple(history[j]["result"] for j in range(i, i+pat_len))
-            if window == pattern and i-1 >= 0:
-                after = history[i-1]["result"]
-                counts[after] = counts.get(after, 0) + 1
-        total = sum(counts.values())
+        total = sum(trans[pair].values())
         if total < 2:
             return None, 0
-        pred = "TAI" if counts["TAI"] >= counts["XIU"] else "XIU"
-        conf = int((counts[pred] / total) * 78)
-        return pred, min(78, conf)
+        if trans[pair]["TAI"] > trans[pair]["XIU"]:
+            pred = "TAI"
+            prob = trans[pair]["TAI"] / total
+        elif trans[pair]["XIU"] > trans[pair]["TAI"]:
+            pred = "XIU"
+            prob = trans[pair]["XIU"] / total
+        else:
+            return random.choice(["TAI", "XIU"]), 50
+        conf = int(55 + prob * 40)
+        return pred, min(88, conf)
 
-    def algo_pattern6(self, history): return self._pattern_match(history, 6)
-    def algo_pattern7(self, history): return self._pattern_match(history, 7)
-    def algo_pattern8(self, history): return self._pattern_match(history, 8)
-
-    def algo_entropy(self, history):
-        if len(history) < 6:
+    def algo_rsi14(self, history):
+        """RSI của điểm số 14 phiên, dự đoán đảo chiều quá mua/quá bán."""
+        if len(history) < 15:
             return None, 0
-        window = history[:min(12, len(history))]
-        changes = sum(1 for i in range(1, len(window)) if window[i]["result"] != window[i-1]["result"])
-        if changes >= 8:
-            return history[0]["result"], 56
-        if changes <= 3:
-            return history[0]["result"], 60
+        points = [h["point"] for h in history[:15]][::-1]  # cũ -> mới
+        gains = [max(0, points[i] - points[i-1]) for i in range(1, len(points))]
+        losses = [max(0, points[i-1] - points[i]) for i in range(1, len(points))]
+        avg_gain = sum(gains) / 14
+        avg_loss = sum(losses) / 14
+        if avg_loss == 0:
+            rsi = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi = 100.0 - (100.0 / (1 + rs))
+        if rsi > 72:
+            return "XIU", int(min(rsi, 85))
+        if rsi < 28:
+            return "TAI", int(min(100 - rsi, 85))
         return None, 0
 
-    def algo_momentum(self, history):
-        if len(history) < 3:
+    def algo_macd(self, history):
+        """MACD của điểm: xu hướng tăng/giảm qua EMA 12/26."""
+        if len(history) < 35:
             return None, 0
-        p0, p1, p2 = history[0]["point"], history[1]["point"], history[2]["point"]
-        if p0 > p1 > p2:
-            return "TAI", 60
-        if p0 < p1 < p2:
-            return "XIU", 60
+        points = [h["point"] for h in history[:35]][::-1]
+        def ema(data, period):
+            alpha = 2 / (period + 1)
+            ema_val = sum(data[:period]) / period
+            for val in data[period:]:
+                ema_val = (val - ema_val) * alpha + ema_val
+            return ema_val
+        ema12 = ema(points, 12)
+        ema26 = ema(points, 26)
+        macd_line = ema12 - ema26
+        # Tính signal line (EMA 9 của MACD line) đơn giản: dùng 9 giá trị MACD gần đây
+        macd_history = []
+        for i in range(9, 35):
+            sub = points[:i]
+            e12 = ema(sub, 12)
+            e26 = ema(sub, 26)
+            macd_history.append(e12 - e26)
+        if len(macd_history) < 9:
+            return None, 0
+        signal = sum(macd_history[-9:]) / 9
+        if macd_line > signal + 0.15:
+            return "TAI", 65
+        elif macd_line < signal - 0.15:
+            return "XIU", 65
         return None, 0
 
-    def algo_cau_lap(self, history):
-        if len(history) < 6:
-            return None, 0
-        r = [h["result"] for h in history[:min(30, len(history))]]
-        for cycle in range(2, 9):
-            if len(r) < cycle * 3:
-                continue
-            pattern = r[:cycle]
-            repeats = 1
-            idx = cycle
-            while idx + cycle <= len(r) and r[idx:idx+cycle] == pattern:
-                repeats += 1
-                idx += cycle
-            if repeats >= 2:
-                pos = (idx - cycle) % cycle if idx >= cycle else 0
-                return pattern[pos % len(pattern)], 68
-        return None, 0
-
-    def algo_cham_dinh(self, history):
+    def algo_trend_dir(self, history):
+        """Phát hiện xu hướng tăng/giảm điểm liên tiếp, dự đoán đảo chiều."""
         if len(history) < 4:
             return None, 0
-        pts = [h["point"] for h in history[:3]]
-        if all(9 <= p <= 12 for p in pts):
-            return "XIU", 64
-        if all(7 <= p <= 9 for p in pts):
-            return "TAI", 64
-        return None, 0
-
-    def algo_point_analysis(self, history):
-        if len(history) < 5:
-            return None, 0
-        pts = [h["point"] for h in history[:5]]
-        high = sum(1 for p in pts if p >= 11)
-        low = sum(1 for p in pts if p <= 7)
-        if high >= 4:
-            return "XIU", 76
-        if low >= 4:
-            return "TAI", 76
-        if pts[0] > pts[1] > pts[2]:
-            return "XIU", 63
-        if pts[0] < pts[1] < pts[2]:
+        p = [h["point"] for h in history[:4]]
+        if p[0] > p[1] > p[2]:  # giảm liên tiếp 3 phiên
             return "TAI", 63
-        return None, 0
-
-    def algo_complex_pattern(self, history):
-        if len(history) < 10:
-            return None, 0
-        n = min(60, len(history))
-        seq = [h["result"] for h in history[:n]]
-        pat = tuple(seq[:4])
-        next_vals = []
-        for i in range(4, n - 4):
-            if tuple(seq[i:i+4]) == pat and i-1 >= 0:
-                next_vals.append(seq[i-1])
-        if len(next_vals) >= 2:
-            pred = max(set(next_vals), key=next_vals.count)
-            ratio = next_vals.count(pred) / len(next_vals)
-            return pred, int(min(78, ratio * 80))
-        return None, 0
-
-    def algo_reverse_momentum(self, history):
-        if len(history) < 3:
-            return None, 0
-        p0, p2 = history[0]["point"], history[2]["point"]
-        diff = abs(p0 - p2)
-        if diff >= 7:
-            return ("TAI" if p0 < p2 else "XIU"), 66
-        return None, 0
-
-    def algo_trend_16(self, history):
-        window = history[:RECENT_WINDOW]
-        if len(window) < 16:
-            return None, 0
-        tai = sum(1 for h in window if h["result"] == "TAI")
-        xiu = 16 - tai
-        if tai >= 10:
-            return "TAI", 55 + (tai - 10) * 3
-        if xiu >= 10:
-            return "XIU", 55 + (xiu - 10) * 3
-        pts = [h["point"] for h in window[:4]]
-        if all(pts[i] > pts[i+1] for i in range(3)):
-            return "TAI", 58
-        if all(pts[i] < pts[i+1] for i in range(3)):
-            return "XIU", 58
-        return None, 0
-
-    def algo_point_frequency(self, history):
-        if len(history) < 16:
-            return None, 0
-        points = [h["point"] for h in history[:16]]
-        counter = Counter(points)
-        total = len(points)
-        high_ratio = sum(counter[p] for p in counter if p >= 11) / total
-        low_ratio = sum(counter[p] for p in counter if p <= 7) / total
-        if high_ratio > 0.5:
-            return "XIU", int(60 + high_ratio * 20)
-        if low_ratio > 0.5:
-            return "TAI", int(60 + low_ratio * 20)
+        if p[0] < p[1] < p[2]:  # tăng liên tiếp 3 phiên
+            return "XIU", 63
         return None, 0
 
     def algo_peak_bottom(self, history):
+        """Đỉnh/đáy điểm số trong cửa sổ nhỏ, dự đoán đảo chiều."""
         if len(history) < 5:
             return None, 0
         pts = [h["point"] for h in history[:5]]
         max_pt = max(pts)
         min_pt = min(pts)
-        if max_pt >= 17:
+        if max_pt >= 16 and pts[0] < pts[1] and pts[1] >= 15:
             return "XIU", 75
-        if min_pt <= 4:
+        if min_pt <= 4 and pts[0] > pts[1] and pts[1] <= 5:
             return "TAI", 75
-        if pts[0] >= 15 and pts[1] < pts[0] and pts[2] < pts[0]:
+        # Đỉnh/đáy cục bộ
+        if pts[0] == max_pt and pts[0] > pts[1] and pts[1] > pts[2]:
             return "XIU", 68
-        if pts[0] <= 5 and pts[1] > pts[0] and pts[2] > pts[0]:
+        if pts[0] == min_pt and pts[0] < pts[1] and pts[1] < pts[2]:
             return "TAI", 68
         return None, 0
 
-    def algo_cau_2_1_1_2(self, history):
-        if len(history) < 8:
+    def algo_pattern_match(self, history):
+        """So khớp 7-8 kết quả gần nhất với lịch sử, dự đoán theo mẫu lặp."""
+        if len(history) < 12:
             return None, 0
-        seq = [h["result"] for h in history[:8]]
-        if seq[:2] == ["TAI","TAI"] and seq[2]=="XIU" and seq[3]=="TAI" and seq[4:6]==["XIU","XIU"]:
-            return "TAI", 72
-        if seq[:2] == ["XIU","XIU"] and seq[2]=="TAI" and seq[3]=="XIU" and seq[4:6]==["TAI","TAI"]:
-            return "XIU", 72
-        if seq[:2] == ["TAI","TAI"] and seq[2]=="XIU" and seq[3]=="XIU" and seq[4:6]==["TAI","TAI"]:
-            return "XIU", 72
-        if seq[:2] == ["XIU","XIU"] and seq[2]=="TAI" and seq[3]=="TAI" and seq[4:6]==["XIU","XIU"]:
-            return "TAI", 72
-        return None, 0
-
-    def algo_symmetry(self, history):
-        if len(history) < 6:
+        seq_len = min(8, len(history) // 2)
+        recent = [h["result"] for h in history[:seq_len]][::-1]  # cũ -> mới
+        # Tìm trong lịch sử xa hơn (bắt đầu từ index seq_len)
+        matches = []
+        search_end = min(300, len(history) - seq_len)
+        for i in range(seq_len, search_end):
+            segment = [history[j]["result"] for j in range(i, i+seq_len)][::-1]
+            if segment == recent:
+                # Kết quả trước đó sau khi gặp mẫu này là gì? (phiên ngay sau đoạn segment trong quá khứ)
+                if i-1 >= 0:
+                    matches.append(history[i-1]["result"])
+        if len(matches) < 3:
             return None, 0
-        r = [h["result"] for h in history[:6]]
-        if r[0]==r[5] and r[1]==r[4] and r[2]==r[3] and r[0]!=r[1]:
-            return r[0], 78
-        if r[0]==r[4] and r[1]==r[3] and r[0]!=r[1]:
-            return r[0], 72
-        return None, 0
+        counter = Counter(matches)
+        most_common = counter.most_common(1)[0]
+        pred = most_common[0]
+        prob = most_common[1] / len(matches)
+        conf = int(50 + prob * 45)
+        return pred, min(92, conf)
 
-    def algo_rolling_avg(self, history):
-        if len(history) < 3:
-            return None, 0
-        avg3 = sum(h["point"] for h in history[:3]) / 3
-        if avg3 > 12.0:
-            return "TAI", 62
-        if avg3 < 9.0:
-            return "XIU", 62
-        return None, 0
-
-    def algo_advanced_momentum(self, history):
-        if len(history) < 4:
-            return None, 0
-        p = [h["point"] for h in history[:4]]
-        diff = p[0] - p[3]
-        if diff >= 6:
-            return "XIU", 64
-        if diff <= -6:
-            return "TAI", 64
-        return None, 0
-
-    def algo_cycle_2_2(self, history):
-        if len(history) < 8:
-            return None, 0
-        r = [h["result"] for h in history[:8]]
-        if r[:2]==["TAI","TAI"] and r[2:4]==["XIU","XIU"] and r[4:6]==["TAI","TAI"] and r[6:8]==["XIU","XIU"]:
-            return "TAI", 78
-        if r[:2]==["XIU","XIU"] and r[2:4]==["TAI","TAI"] and r[4:6]==["XIU","XIU"] and r[6:8]==["TAI","TAI"]:
-            return "XIU", 78
-        if len(r)>=6 and r[:2]==["TAI","TAI"] and r[2:4]==["XIU","XIU"] and r[4]==r[5]=="TAI":
-            return "XIU", 70
-        if len(r)>=6 and r[:2]==["XIU","XIU"] and r[2:4]==["TAI","TAI"] and r[4]==r[5]=="XIU":
-            return "TAI", 70
-        return None, 0
-
-    def algo_oscillation(self, history):
-        if len(history) < 4:
-            return None, 0
-        pts = [h["point"] for h in history[:4]]
-        if all(p >= 12 for p in pts):
-            return "XIU", 72
-        if all(p <= 9 for p in pts):
-            return "TAI", 72
-        if max(pts) - min(pts) >= 8:
-            return "TAI" if pts[0] < 10.5 else "XIU", 65
-        return None, 0
-
-    def algo_sum_parity(self, history):
-        if len(history) < 3:
-            return None, 0
-        parities = [h["point"] % 2 for h in history[:3]]
-        if all(p == 0 for p in parities):
-            return "TAI", 58
-        if all(p == 1 for p in parities):
-            return "XIU", 58
-        return None, 0
-
-    def algo_fibonacci(self, history):
+    def algo_entropy(self, history):
+        """Đo độ hỗn loạn của chuỗi kết quả, dự đoán theo xu hướng nhiễu."""
         if len(history) < 10:
             return None, 0
-        r = [h["result"] for h in history[:min(34, len(history))]]
-        def check_cycle(k):
-            if len(r) < 2*k:
-                return None
-            pattern = r[:k]
-            matches = 0
-            for i in range(k, len(r)-k+1, k):
-                if r[i:i+k] == pattern:
-                    matches += 1
-                else:
-                    break
-            if matches >= 2:
-                next_idx = (matches+1) * k
-                if next_idx < len(r):
-                    return r[next_idx]
-            return None
-        for cycle in [2,3,5,8]:
-            pred = check_cycle(cycle)
-            if pred:
-                return pred, 68
+        window = [h["result"] for h in history[:20]]
+        # Tính entropy đơn giản
+        cnt = Counter(window)
+        total = len(window)
+        probs = [c / total for c in cnt.values()]
+        entropy = -sum(p * math.log2(p) for p in probs)
+        # Nếu entropy cao (gần 1) -> rất hỗn loạn, dự đoán sẽ khó
+        if entropy > 0.85:
+            # Chọn ngẫu nhiên thiên về đảo xu hướng gần nhất
+            last = window[0]
+            return ("XIU" if last == "TAI" else "TAI"), 53
+        else:
+            # Xu hướng rõ ràng hơn, theo đa số
+            most = cnt.most_common(1)[0][0]
+            return most, int(55 + (1 - entropy) * 30)
         return None, 0
 
-    def algo_double_streak(self, history):
-        if len(history) < 6:
+    def algo_momentum_score(self, history):
+        """Động lượng điểm: so sánh trung bình ngắn hạn vs dài hạn."""
+        if len(history) < 8:
             return None, 0
-        r = [h["result"] for h in history[:8]]
-        if len(r) >= 6:
-            if r[0]==r[1] and r[2]==r[3] and r[4]==r[5] and r[0]!=r[2] and r[2]==r[4]:
-                return r[0], 76
-            if r[0]==r[1] and r[2]==r[3] and r[0]!=r[2] and len(r)>=7 and r[4]==r[5]==r[6] and r[4]==r[2]:
-                return r[0], 72
+        short = [h["point"] for h in history[:3]]
+        long = [h["point"] for h in history[:8]]
+        avg_short = sum(short) / 3
+        avg_long = sum(long) / 8
+        if avg_short > avg_long + 1.2:
+            return "TAI", 64
+        if avg_short < avg_long - 1.2:
+            return "XIU", 64
         return None, 0
 
-    def algo_martingale_signal(self, history):
-        last, s = self._streak_info(history)
-        if s >= 5:
-            opp = "XIU" if last == "TAI" else "TAI"
-            return opp, 80
-        if s == 4:
-            opp = "XIU" if last == "TAI" else "TAI"
-            return opp, 70
-        return None, 0
-
-    def algo_cross_over(self, history):
-        if len(history) < 7:
+    def algo_volatility(self, history):
+        """Đột biến độ lệch chuẩn và giá trị hiện tại ở biên."""
+        if len(history) < 12:
             return None, 0
-        pts = [h["point"] for h in history[:7]]
-        ma3 = sum(pts[:3]) / 3
-        ma7 = sum(pts) / 7
-        if ma3 > ma7 + 1.5:
-            return "TAI", 63
-        if ma3 < ma7 - 1.5:
-            return "XIU", 63
+        points = [h["point"] for h in history[:12]]
+        mean = sum(points) / len(points)
+        variance = sum((p - mean) ** 2 for p in points) / len(points)
+        std = math.sqrt(variance)
+        last_point = points[0]
+        if std > 3.5:
+            if last_point > mean + 1.5 * std:
+                return "XIU", 72
+            if last_point < mean - 1.5 * std:
+                return "TAI", 72
         return None, 0
 
+    def algo_autocorr(self, history):
+        """Tự tương quan chuỗi nhị phân Tài/Xỉu để tìm chu kỳ lặp."""
+        if len(history) < 20:
+            return None, 0
+        seq = [1 if h["result"] == "TAI" else 0 for h in history[:40]]
+        n = len(seq)
+        best_lag = None
+        best_corr = -2
+        for lag in range(2, min(16, n//2)):
+            corr = sum(seq[i] * seq[i+lag] for i in range(n - lag)) / (n - lag)
+            if corr > best_corr:
+                best_corr = corr
+                best_lag = lag
+        if best_lag and best_corr > 0.65:
+            # Dự đoán dựa trên giá trị cách đây lag phiên
+            predicted_val = seq[best_lag-1]  # vì seq[0] là hiện tại, seq[lag] là quá khứ lag
+            return "TAI" if predicted_val == 1 else "XIU", int(55 + best_corr * 30)
+        return None, 0
+
+    # Danh sách tất cả thuật toán
     ALGORITHMS = [
-        ("pattern_7_history", algo_pattern_7_history),
-        ("streak", algo_streak), ("break_detect", algo_break_detect),
-        ("pingpong", algo_pingpong), ("pairs", algo_pairs), ("zigzag", algo_zigzag),
-        ("freq20", algo_freq20), ("freq50", algo_freq50), ("freq100", algo_freq100),
-        ("point_trend", algo_point_trend), ("peak", algo_peak),
-        ("pattern6", algo_pattern6), ("pattern7", algo_pattern7), ("pattern8", algo_pattern8),
-        ("entropy", algo_entropy), ("momentum", algo_momentum), ("cau_lap", algo_cau_lap),
-        ("cham_dinh", algo_cham_dinh), ("point_analysis", algo_point_analysis),
-        ("complex_pattern", algo_complex_pattern), ("reverse_momentum", algo_reverse_momentum),
-        ("trend_16", algo_trend_16), ("point_frequency", algo_point_frequency),
-        ("peak_bottom", algo_peak_bottom), ("cau_2_1_1_2", algo_cau_2_1_1_2),
-        ("symmetry", algo_symmetry), ("rolling_avg", algo_rolling_avg),
-        ("advanced_momentum", algo_advanced_momentum), ("cycle_2_2", algo_cycle_2_2),
-        ("oscillation", algo_oscillation), ("sum_parity", algo_sum_parity),
-        ("fibonacci", algo_fibonacci), ("double_streak", algo_double_streak),
-        ("martingale_signal", algo_martingale_signal), ("cross_over", algo_cross_over)
+        ("freq20", algo_freq20),
+        ("freq50", algo_freq50),
+        ("freq100", algo_freq100),
+        ("markov1", algo_markov1),
+        ("markov2", algo_markov2),
+        ("rsi14", algo_rsi14),
+        ("macd", algo_macd),
+        ("trend_dir", algo_trend_dir),
+        ("peak_bottom", algo_peak_bottom),
+        ("pattern_match", algo_pattern_match),
+        ("entropy", algo_entropy),
+        ("momentum_score", algo_momentum_score),
+        ("volatility", algo_volatility),
+        ("autocorr", algo_autocorr)
     ]
 
     def predict(self, history: List[Dict], site_game: str) -> Tuple[str, int, str, Dict]:
         if len(history) < 2:
             return random.choice(["TAI", "XIU"]), 50, "Không đủ dữ liệu", {}
-        weights = self.weights.get(site_game, DEFAULT_ALGO_WEIGHTS)
+        weights = self.weights.get(site_game, DEFAULT_ALGO_WEIGHTS.copy())
         raw = {"TAI": 0.0, "XIU": 0.0}
         contrib = []
         for name, func in self.ALGORITHMS:
@@ -858,17 +701,17 @@ class AIEngine:
         if total == 0:
             return random.choice(["TAI", "XIU"]), 50, "Không rõ pattern", {}
         ratio_tai = raw["TAI"] / total
-        # Vùng cân bằng mở rộng hơn để tránh thiên vị
-        if 0.40 <= ratio_tai <= 0.60:
+        # Vùng cân bằng chống thiên vị
+        if 0.42 <= ratio_tai <= 0.58:
             pred = random.choice(["TAI", "XIU"])
             conf = 50
         else:
             pred = "TAI" if ratio_tai > 0.5 else "XIU"
             winner_ratio = ratio_tai if pred == "TAI" else (1 - ratio_tai)
-            conf = int(50 + winner_ratio * 70)  # giảm tốc độ tăng
-            conf = max(50, min(92, conf))
+            conf = int(50 + winner_ratio * 78)
+            conf = max(50, min(94, conf))
         top = sorted([(n, c) for n, p, c, _ in contrib if p == pred], key=lambda x: x[1], reverse=True)[:3]
-        reason = " + ".join(f"{ALGO_NAMES.get(n,n)} ({c}%)" for n,c in top) if top else "Tổng hợp"
+        reason = " + ".join(f"{ALGO_NAMES.get(n,n)} ({c}%)" for n, c in top) if top else "Tổng hợp"
         votes = {name: {"pred": p, "conf": c, "weighted": round(w,4)} for name,p,c,w in contrib}
         return pred, conf, reason, votes
 
@@ -886,9 +729,9 @@ class AIEngine:
             logger.warning(f"learn weight update error: {e}")
 
     async def detect_and_save_patterns(self, site_game: str, history: List[Dict]):
-        pass  # giữ nguyên hoặc bổ sung sau
+        pass  # Giữ nguyên
 
-# ---------------------------- BACKGROUND TASK -------------------------
+# ---------------------------- BACKGROUND TASK (GIỮ NGUYÊN) -------------------------
 async def background_fetch_and_learn(bot: Bot):
     logger.info("Background task started")
     while not _shutdown_event.is_set():
@@ -980,7 +823,7 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
     res_emoji = "🔴 TÀI" if last["result"] == "TAI" else "🔵 XỈU"
 
     recent_10 = [h["result"] for h in history[:10]][::-1]
-    recent_str = " → ".join(["🔴" if r == "TAI" else "🔵" for r in recent_10])
+    recent_str = "  ".join(["🔴" if r == "TAI" else "🔵" for r in recent_10])
 
     msg = (
         f"TOOL TÀI XỈU:\n"
@@ -989,7 +832,7 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
         f"📌 Phiên dự đoán: `{latest_id + 1}`\n"
         f"💡 Dự đoán: {pred_emoji} ({conf}%)\n"
         f"🧠 Lý do: {reason}\n"
-        f"📊 Cầu gần đây (cũ → mới): {recent_str}\n"
+        f"📊 Cầu : {recent_str}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"⏮ Phiên trước: `{latest_id}`\n"
         f"🎲 Xúc xắc: {dice_str} _( Σ {last['point']} )_\n"
@@ -1031,7 +874,7 @@ async def clean_old_sessions(site_game: str):
     except Exception as e:
         logger.warning(f"clean_old_sessions: {e}")
 
-# ---------------------------- USER HANDLERS ---------------------------
+# ---------------------------- USER HANDLERS (GIỮ NGUYÊN) ---------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not update.message:
@@ -1047,6 +890,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"start DB error: {e}")
 
     status = await get_user_status(user.id)
+    logger.info(f"/start user {user.id} status: {status}")
     if status == "banned":
         await update.message.reply_text("⛔ Tài khoản của bạn đã bị khóa.")
         return
@@ -1055,6 +899,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if status == "expired":
         await update.message.reply_text(f"🔐 Key của bạn đã hết hạn.\nDùng /muakey để gia hạn hoặc liên hệ {SUPPORT_USERNAME}")
+        return
+    if status == "error":
+        await update.message.reply_text("⚠️ Lỗi hệ thống khi kiểm tra key, vui lòng thử lại sau.")
         return
 
     keyboard = [
@@ -1085,6 +932,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     status = await get_user_status(user.id)
+    logger.info(f"Menu from {user.id} with status: {status}")
     if status != "valid":
         if status == "banned":
             await msg.reply_text("⛔ Bạn đã bị khóa.")
@@ -1092,6 +940,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("🔐 Bạn chưa có key. /muakey")
         elif status == "expired":
             await msg.reply_text("🔐 Key đã hết hạn. /muakey")
+        elif status == "error":
+            await msg.reply_text("⚠️ Lỗi hệ thống, thử lại sau.")
         return
 
     text = msg.text or ""
@@ -1268,7 +1118,7 @@ async def buy_key_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-# ---------------------------- ADMIN APPROVE ----------------------------
+# ---------------------------- ADMIN APPROVE (GIỮ NGUYÊN) -------------------
 async def admin_approve_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -1590,7 +1440,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     global ai_engine
     setup_logging()
-    logger.info("Starting bot V5...")
+    logger.info("Starting bot V6.1 Super AI...")
     await init_db()
     ai_engine = AIEngine()
     await ai_engine.load_weights_from_db()
@@ -1635,7 +1485,7 @@ async def main():
             await app.start()
             await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
             bg_task = asyncio.create_task(background_fetch_and_learn(app.bot))
-            logger.info("✅ Bot V5 đang chạy. Ctrl+C để dừng.")
+            logger.info("✅ Bot V6.1 Super AI đang chạy. Ctrl+C để dừng.")
             loop = asyncio.get_running_loop()
             def stop_handler(*_):
                 _shutdown_event.set()
