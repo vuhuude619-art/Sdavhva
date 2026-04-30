@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Bot dự đoán Tài Xỉu siêu AI - Nâng cấp toàn diện V4
-- Sửa lỗi xác thực key, thông báo chi tiết
-- Thêm thuật toán Pattern 7 phiên lịch sử (cực mạnh)
-- Đa dạng thuật toán: bệt, bẻ, cầu lặp, chạm đỉnh đáy, xu hướng điểm
-- Giao diện trực quan, hiển thị chuỗi cầu
-- Quản lý key, CSKH, admin, broadcast, antispam đầy đủ
+Bot dự đoán Tài Xỉu siêu AI - Nâng cấp toàn diện V5
+- SỬA LỖI KIỂM TRA KEY (dùng uk.activated) → không còn báo sai
+- Đầy đủ lệnh admin, CSKH, mua key, broadcast
+- Thuật toán cân bằng, chống thiên vị, tối ưu vùng cân bằng
+- Giao diện hiển thị chuỗi cầu, lịch sử cá nhân rõ ràng
 """
 
 import asyncio
@@ -99,19 +98,19 @@ PRICE_PLANS = {"1": 15000, "7": 70000, "30": 360000}
 
 # ---------------------------- AI CONFIG ------------------------------
 DEFAULT_ALGO_WEIGHTS = {
-    "streak": 1.2, "break_detect": 1.4, "pingpong": 1.1,
+    "streak": 1.0, "break_detect": 1.2, "pingpong": 1.0,
     "pairs": 1.0, "zigzag": 0.9, "freq20": 1.0,
-    "freq50": 1.1, "freq100": 0.9, "point_trend": 0.8,
-    "peak": 1.3, "pattern6": 1.5, "pattern7": 1.6,
-    "pattern8": 1.5, "entropy": 1.0, "momentum": 1.1,
-    "cau_lap": 1.4, "cham_dinh": 1.4, "point_analysis": 1.2,
-    "complex_pattern": 1.5, "reverse_momentum": 1.0,
-    "trend_16": 1.8, "point_frequency": 1.3, "peak_bottom": 1.6,
-    "cau_2_1_1_2": 1.7, "symmetry": 1.4, "rolling_avg": 1.2,
-    "advanced_momentum": 1.3, "cycle_2_2": 1.5,
-    "oscillation": 1.2, "sum_parity": 1.0, "fibonacci": 1.3,
-    "double_streak": 1.4, "martingale_signal": 1.1,
-    "cross_over": 1.2, "pattern_7_history": 2.5  # Ưu tiên cao nhất
+    "freq50": 1.0, "freq100": 0.9, "point_trend": 0.8,
+    "peak": 1.2, "pattern6": 1.3, "pattern7": 1.4,
+    "pattern8": 1.3, "entropy": 1.0, "momentum": 1.0,
+    "cau_lap": 1.3, "cham_dinh": 1.2, "point_analysis": 1.1,
+    "complex_pattern": 1.3, "reverse_momentum": 1.0,
+    "trend_16": 1.5, "point_frequency": 1.2, "peak_bottom": 1.5,
+    "cau_2_1_1_2": 1.4, "symmetry": 1.3, "rolling_avg": 1.1,
+    "advanced_momentum": 1.2, "cycle_2_2": 1.3,
+    "oscillation": 1.1, "sum_parity": 1.0, "fibonacci": 1.2,
+    "double_streak": 1.3, "martingale_signal": 1.2,
+    "cross_over": 1.1, "pattern_7_history": 2.5
 }
 
 ALGO_NAMES = {
@@ -279,24 +278,25 @@ async def check_antispam(user_id: int) -> bool:
         return True
 
 async def get_user_status(user_id: int) -> str:
-    """Trả về 'valid', 'banned', 'no_key', 'expired'"""
+    """Trả về: 'valid', 'banned', 'no_key', 'expired'"""
     try:
         async with db.execute("SELECT banned FROM users WHERE user_id=?", (user_id,)) as cur:
             row = await cur.fetchone()
             if row and row[0] == 1:
                 return "banned"
         async with db.execute(
-            "SELECT k.days, k.created FROM user_keys uk JOIN keys k ON uk.key=k.key WHERE uk.user_id=?", (user_id,)
+            "SELECT k.days, uk.activated FROM user_keys uk INNER JOIN keys k ON uk.key = k.key WHERE uk.user_id=?",
+            (user_id,)
         ) as cur:
             key_info = await cur.fetchone()
         if not key_info:
             return "no_key"
-        days, created = key_info
-        if time.time() < created + days * 86400:
+        days, activated = key_info
+        if time.time() < activated + days * 86400:
             return "valid"
         return "expired"
     except Exception as e:
-        logger.warning(f"get_user_status error {user_id}: {e}")
+        logger.error(f"get_user_status error {user_id}: {e}")
         return "no_key"
 
 async def is_maintenance() -> bool:
@@ -373,7 +373,7 @@ async def typing_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-# ---------------------------- AI ENGINE V4 ----------------------------
+# ---------------------------- AI ENGINE V5 ----------------------------
 class AIEngine:
     def __init__(self):
         self.weights = defaultdict(lambda: DEFAULT_ALGO_WEIGHTS.copy())
@@ -404,20 +404,14 @@ class AIEngine:
 
     # ------------------------- CÁC THUẬT TOÁN -------------------------
     def algo_pattern_7_history(self, history):
-        """Tìm mẫu 7 phiên gần nhất trong lịch sử, dự đoán phiên tiếp theo"""
         if len(history) < 8:
             return None, 0
-        # 7 phiên gần nhất, sắp xếp từ cũ -> mới
-        recent_7 = [h["result"] for h in history[:7]][::-1]  # từ cũ đến mới
-        # Duyệt lịch sử để tìm các đoạn giống
+        recent_7 = [h["result"] for h in history[:7]][::-1]  # cũ -> mới
         next_results = []
-        # Bỏ 7 phiên đầu, duyệt từ index 7 trở đi
         for i in range(7, len(history) - 1):
-            # Lấy 7 phiên từ i-6 đến i (cũ->mới)
             segment = [history[j]["result"] for j in range(i, i-7, -1)][::-1]
             if segment == recent_7 and i-7 >= 0:
-                next_result = history[i-7]["result"]
-                next_results.append(next_result)
+                next_results.append(history[i-7]["result"])
         if len(next_results) >= 2:
             counter = Counter(next_results)
             most_common = counter.most_common(1)[0]
@@ -825,9 +819,8 @@ class AIEngine:
             return "XIU", 63
         return None, 0
 
-    # Tổng hợp tất cả thuật toán
     ALGORITHMS = [
-        ("pattern_7_history", algo_pattern_7_history),  # Đặt đầu để ưu tiên
+        ("pattern_7_history", algo_pattern_7_history),
         ("streak", algo_streak), ("break_detect", algo_break_detect),
         ("pingpong", algo_pingpong), ("pairs", algo_pairs), ("zigzag", algo_zigzag),
         ("freq20", algo_freq20), ("freq50", algo_freq50), ("freq100", algo_freq100),
@@ -865,13 +858,14 @@ class AIEngine:
         if total == 0:
             return random.choice(["TAI", "XIU"]), 50, "Không rõ pattern", {}
         ratio_tai = raw["TAI"] / total
-        if 0.46 <= ratio_tai <= 0.54:
+        # Vùng cân bằng mở rộng hơn để tránh thiên vị
+        if 0.40 <= ratio_tai <= 0.60:
             pred = random.choice(["TAI", "XIU"])
             conf = 50
         else:
             pred = "TAI" if ratio_tai > 0.5 else "XIU"
             winner_ratio = ratio_tai if pred == "TAI" else (1 - ratio_tai)
-            conf = int(50 + winner_ratio * 80)
+            conf = int(50 + winner_ratio * 70)  # giảm tốc độ tăng
             conf = max(50, min(92, conf))
         top = sorted([(n, c) for n, p, c, _ in contrib if p == pred], key=lambda x: x[1], reverse=True)[:3]
         reason = " + ".join(f"{ALGO_NAMES.get(n,n)} ({c}%)" for n,c in top) if top else "Tổng hợp"
@@ -892,17 +886,7 @@ class AIEngine:
             logger.warning(f"learn weight update error: {e}")
 
     async def detect_and_save_patterns(self, site_game: str, history: List[Dict]):
-        if len(history) < 6:
-            return
-        r = [h["result"] for h in history[:min(50, len(history))]]
-        sid = history[0]["id"]
-        try:
-            last, streak = self._streak_info(history)
-            if streak >= 4:
-                await db.execute(
-                    "INSERT INTO patterns (...) ...")  # giữ nguyên
-        except:
-            pass
+        pass  # giữ nguyên hoặc bổ sung sau
 
 # ---------------------------- BACKGROUND TASK -------------------------
 async def background_fetch_and_learn(bot: Bot):
@@ -938,7 +922,6 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
     latest_id = int(latest.get("id", 0))
     if latest_id == 0:
         return
-    # Kiểm tra trùng
     async with db.execute("SELECT 1 FROM sessions WHERE site_game=? AND session_id=?", (game_key, latest_id)) as cur:
         if await cur.fetchone():
             return
@@ -954,7 +937,6 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
         return
     await clean_old_sessions(game_key)
 
-    # Lấy 500 phiên mới nhất để có đủ dữ liệu cho pattern 7 lịch sử
     async with db.execute(
         "SELECT session_id, result, dices, point FROM sessions WHERE site_game=? ORDER BY session_id DESC LIMIT 500",
         (game_key,)
@@ -964,7 +946,6 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
         return
     history = [{"id": r[0], "result": r[1], "dices": _safe_json(r[2], []), "point": r[3] or 0} for r in rows]
 
-    # Cập nhật kết quả cho dự đoán cũ
     async with db.execute(
         "SELECT id, predicted, confidence, algo_votes FROM predictions WHERE site_game=? AND session_id=? AND actual IS NULL ORDER BY id DESC LIMIT 1",
         (game_key, latest_id)
@@ -979,7 +960,6 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
         algo_votes = _safe_json(pending[3], {})
         await ai_engine.learn_from_outcome(game_key, pending[1], actual, algo_votes)
 
-    # Dự đoán phiên tiếp theo
     pred, conf, reason, votes = ai_engine.predict(history, game_key)
     try:
         await db.execute(
@@ -990,7 +970,6 @@ async def _process_game(bot: Bot, game_key: str, game_conf: Dict):
     except Exception as e:
         logger.warning(f"Insert prediction error {game_key}: {e}")
 
-    # Broadcast
     watchers = list(user_watches.get(game_key, []))
     if not watchers:
         return
@@ -1071,8 +1050,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if status == "banned":
         await update.message.reply_text("⛔ Tài khoản của bạn đã bị khóa.")
         return
-    if status in ("no_key", "expired"):
-        await update.message.reply_text(f"🔐 Bạn chưa kích hoạt key hoặc key đã hết hạn.\nDùng /muakey để mua hoặc liên hệ {SUPPORT_USERNAME}")
+    if status == "no_key":
+        await update.message.reply_text(f"🔐 Bạn chưa có key.\nDùng /muakey để mua hoặc liên hệ {SUPPORT_USERNAME}")
+        return
+    if status == "expired":
+        await update.message.reply_text(f"🔐 Key của bạn đã hết hạn.\nDùng /muakey để gia hạn hoặc liên hệ {SUPPORT_USERNAME}")
         return
 
     keyboard = [
@@ -1092,7 +1074,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not user or not msg:
         return
-    # Kiểm tra chat CSKH
     if user.id in active_chats:
         other = active_chats[user.id]
         if msg.text and not msg.text.startswith("/"):
@@ -1104,11 +1085,13 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     status = await get_user_status(user.id)
-    if status == "banned":
-        await msg.reply_text("⛔ Bạn đã bị khóa khỏi hệ thống.")
-        return
-    if status in ("no_key", "expired"):
-        await msg.reply_text("🔐 Key không hợp lệ hoặc hết hạn. /muakey")
+    if status != "valid":
+        if status == "banned":
+            await msg.reply_text("⛔ Bạn đã bị khóa.")
+        elif status == "no_key":
+            await msg.reply_text("🔐 Bạn chưa có key. /muakey")
+        elif status == "expired":
+            await msg.reply_text("🔐 Key đã hết hạn. /muakey")
         return
 
     text = msg.text or ""
@@ -1162,15 +1145,15 @@ async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     try:
         async with db.execute(
-            "SELECT k.key, k.days, k.created FROM user_keys uk JOIN keys k ON uk.key=k.key WHERE uk.user_id=?", (uid,)
+            "SELECT k.key, k.days, uk.activated FROM user_keys uk JOIN keys k ON uk.key=k.key WHERE uk.user_id=?", (uid,)
         ) as cur:
             ki = await cur.fetchone()
         if not ki:
             await update.message.reply_text("❌ Chưa có key.")
             return
-        key, days, created = ki
-        expiry = datetime.fromtimestamp(created + days * 86400).strftime("%d/%m/%Y %H:%M")
-        remaining = max(0, int((created + days * 86400 - time.time()) / 3600))
+        key, days, activated = ki
+        expiry = datetime.fromtimestamp(activated + days * 86400).strftime("%d/%m/%Y %H:%M")
+        remaining = max(0, int((activated + days * 86400 - time.time()) / 3600))
         status = "✅ Còn hạn" if remaining > 0 else "❌ Hết hạn"
         await update.message.reply_text(
             f"🔑 *Key:* `{key}`\n⏳ *Hết hạn:* {expiry}\n🕐 *Còn lại:* ~{remaining}h\n📌 *Trạng thái:* {status}",
@@ -1428,17 +1411,46 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 total = (await c.fetchone())[0] or 0
             async with db.execute("SELECT COUNT(*) FROM payments WHERE status='approved'") as c:
                 count = (await c.fetchone())[0]
-            await query.message.reply_text(f"💰 *Tổng thu nhập:* {total:,}đ\n📦 Số giao dịch: {count}", parse_mode=ParseMode.MARKDOWN)
+            await query.message.reply_text(f"💰 *Tổng thu nhập:* {total:,}đ\n📦 Số giao dịch thành công: {count}", parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             await query.message.reply_text(f"⚠️ Lỗi: {e}")
     elif data == "admin_maint_on":
         await db.execute("UPDATE bot_config SET value='1' WHERE key='maintenance'"); await db.commit()
-        await query.message.reply_text("🔧 Bảo trì BẬT")
+        await query.message.reply_text("🔧 Chế độ bảo trì: *BẬT*", parse_mode=ParseMode.MARKDOWN)
     elif data == "admin_maint_off":
         await db.execute("UPDATE bot_config SET value='0' WHERE key='maintenance'"); await db.commit()
-        await query.message.reply_text("✅ Bảo trì TẮT")
+        await query.message.reply_text("✅ Chế độ bảo trì: *TẮT*", parse_mode=ParseMode.MARKDOWN)
     elif data == "admin_hoclog":
-        await query.message.reply_text("Xem /history của admin.")
+        try:
+            async with db.execute(
+                "SELECT site_game, session_id, predicted, actual, correct FROM predictions ORDER BY id DESC LIMIT 15"
+            ) as cur:
+                rows = await cur.fetchall()
+            if not rows:
+                await query.message.reply_text("📭 Chưa có log.")
+                return
+            lines = ["📈 *Log học tập (15 mới nhất):*"]
+            for r in rows:
+                label = GAME_MAP.get(r[0], {}).get("label", r[0])
+                correct = "✅" if r[4] == 1 else "❌"
+                lines.append(f"• {label} | P{r[1]} | {r[2]}→{r[3] or '?'} {correct}")
+            await query.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            await query.message.reply_text(f"⚠️ Lỗi: {e}")
+    elif data == "admin_users":
+        try:
+            async with db.execute("SELECT user_id, username, banned FROM users ORDER BY joined_date DESC LIMIT 20") as cur:
+                users = await cur.fetchall()
+            if not users:
+                await query.message.reply_text("Chưa có user.")
+                return
+            text = "👥 *Danh sách user (20 gần nhất):*\n"
+            for uid, uname, banned in users:
+                status = "🚫" if banned else "✅"
+                text += f"• {status} `{uid}` - {uname or 'N/A'}\n"
+            await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            await query.message.reply_text(f"⚠️ Lỗi: {e}")
 
 async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -1518,7 +1530,7 @@ async def admin_setkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.commit()
     expiry = datetime.fromtimestamp(now + days * 86400).strftime("%d/%m/%Y %H:%M")
     await safe_send(context.bot, uid, f"🎉 *Key mới được cấp!*\n🔑 `{key}`\n⏳ Hết hạn: {expiry}", parse_mode=ParseMode.MARKDOWN)
-    await update.message.reply_text(f"✅ Đã cấp key cho user {uid}")
+    await update.message.reply_text(f"✅ Đã cấp key `{key}` cho user {uid}", parse_mode=ParseMode.MARKDOWN)
 
 async def admin_delkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -1547,17 +1559,17 @@ async def admin_editkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("❌ Tham số không hợp lệ.")
         return
-    async with db.execute("SELECT k.key, k.days, k.created FROM user_keys uk JOIN keys k ON uk.key=k.key WHERE uk.user_id=?", (uid,)) as cur:
+    async with db.execute("SELECT k.key, k.days, uk.activated FROM user_keys uk JOIN keys k ON uk.key=k.key WHERE uk.user_id=?", (uid,)) as cur:
         key_info = await cur.fetchone()
     if not key_info:
         await update.message.reply_text("❌ User chưa có key.")
         return
-    key, old_days, created = key_info
+    key, old_days, activated = key_info
     new_days = old_days + add_days
     new_key = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=16))
     now = time.time()
     await db.execute("INSERT OR REPLACE INTO keys (key, days, created, created_by) VALUES (?,?,?,?)", (new_key, new_days, now, update.effective_user.id))
-    await db.execute("UPDATE user_keys SET key=? WHERE user_id=?", (new_key, uid))
+    await db.execute("UPDATE user_keys SET key=?, activated=? WHERE user_id=?", (new_key, now, uid))
     await db.commit()
     expiry = datetime.fromtimestamp(now + new_days * 86400).strftime("%d/%m/%Y %H:%M")
     await safe_send(context.bot, uid, f"🔄 *Key đã được gia hạn!*\n🔑 `{new_key}`\n⏳ Hết hạn mới: {expiry}", parse_mode=ParseMode.MARKDOWN)
@@ -1578,14 +1590,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     global ai_engine
     setup_logging()
-    logger.info("Starting bot V4...")
+    logger.info("Starting bot V5...")
     await init_db()
     ai_engine = AIEngine()
     await ai_engine.load_weights_from_db()
 
     app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
     app.add_handler(MessageHandler(filters.ALL, typing_middleware), group=-1)
-    # user commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("history", cmd_history))
@@ -1593,7 +1604,6 @@ async def main():
     app.add_handler(CommandHandler("muakey", cmd_muakey))
     app.add_handler(CommandHandler("ketthuc", cmd_ketthuc))
     app.add_handler(CommandHandler("nhancskh", cmd_cskh))
-    # admin commands
     app.add_handler(CommandHandler("admin", admin_menu))
     app.add_handler(CommandHandler("broadcast", admin_broadcast))
     app.add_handler(CommandHandler("ban", admin_ban))
@@ -1601,7 +1611,6 @@ async def main():
     app.add_handler(CommandHandler("setkey", admin_setkey))
     app.add_handler(CommandHandler("delkey", admin_delkey))
     app.add_handler(CommandHandler("editkey", admin_editkey))
-    # callbacks
     app.add_handler(CallbackQueryHandler(admin_approve_callback, pattern=r"^(approve_pay|reject_pay)\|"))
     app.add_handler(CallbackQueryHandler(cskh_callback, pattern=r"^cskh_"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
@@ -1626,7 +1635,7 @@ async def main():
             await app.start()
             await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
             bg_task = asyncio.create_task(background_fetch_and_learn(app.bot))
-            logger.info("✅ Bot V4 đang chạy. Ctrl+C để dừng.")
+            logger.info("✅ Bot V5 đang chạy. Ctrl+C để dừng.")
             loop = asyncio.get_running_loop()
             def stop_handler(*_):
                 _shutdown_event.set()
